@@ -60,7 +60,8 @@ async function fetchMinecraftStatus(accessToken) {
       if (typeof prof?.id === 'string') { profileId = prof.id; profileName = typeof prof.name === 'string' ? prof.name.slice(0, 32) : null; }
     }
   }
-  return { owned: owned ? 1 : 0, profileId, profileName };
+  // accessToken：XSTS 派生的 Minecraft 服务短时令牌，仅供实时下发（如启动器），绝不落库。
+  return { owned: owned ? 1 : 0, profileId, profileName, accessToken: xsts.Token };
 }
 const oauthError = (env, detail) => Response.redirect(`${env.WEB_ORIGIN}/login?oauth_error=${encodeURIComponent(detail)}`, 303);
 const auditEvent = (env, actor, action, detail) => env.DB.prepare('INSERT INTO auth_audit(actor,action,created_at,detail) VALUES(?,?,?,?)').bind(actor, action, new Date().toISOString(), detail ?? null);
@@ -164,9 +165,9 @@ async function oauthStart(request, env, provider) {
   ]);
   const authorize = new URL(config.authorize);
   authorize.searchParams.set('client_id', config.clientId); authorize.searchParams.set('redirect_uri', config.callback); authorize.searchParams.set('response_type', 'code'); authorize.searchParams.set('state', state);
-  // Microsoft 仅在“绑定”时额外请求 XboxLive.signin：用于查询 Minecraft 拥有状况与档案，
-  // 供启动器自动添加游戏档案；普通登录保持最小 scope（与 7307a22 的收窄一致）。
-  authorize.searchParams.set('scope', provider === 'microsoft' && mode === 'link' ? `${config.scope} XboxLive.signin` : config.scope);
+  // Microsoft 仅在“绑定”时额外请求 XboxLive.signin 与 offline_access：查询 Minecraft 拥有状况与档案，
+  // 并加密保存刷新令牌供启动器后续派生令牌；普通登录保持最小 scope（与 7307a22 的收窄一致）。
+  authorize.searchParams.set('scope', provider === 'microsoft' && mode === 'link' ? `${config.scope} XboxLive.signin offline_access` : config.scope);
   authorize.searchParams.set('nonce', nonce);
   return new Response(null, { status: 302, headers: { location: authorize.toString(), 'set-cookie': `${oauthStateCookie}=${state}; HttpOnly; SameSite=Lax; Path=/auth/v1/oauth; Max-Age=600${env.LOCAL_DEV === 'true' ? '' : '; Secure'}`, 'cache-control': 'no-store' } });
 }
@@ -210,7 +211,7 @@ async function oauthCallback(request, env, provider, secure) {
     } else {
       const id = crypto.randomUUID(), name = `${provider}:${subject}`;
       await env.DB.batch([
-        env.DB.prepare("INSERT INTO users(id,name,password_hash,display_name,email) VALUES(?,?,?,?,?)").bind(id, name, `oauth:${randomBytes(32).toString('hex')}`, displayName, email),
+        env.DB.prepare("INSERT INTO users(id,name,password_hash,display_name,email,created_at,confirmed_at) VALUES(?,?,?,?,?,?,?)").bind(id, name, `oauth:${randomBytes(32).toString('hex')}`, displayName, email, new Date().toISOString(), new Date().toISOString()),
         env.DB.prepare('INSERT INTO oauth_identities(provider,subject,user_id,email,created_at,updated_at) VALUES(?,?,?,?,?,?)').bind(provider, subject, id, email, new Date().toISOString(), new Date().toISOString())
       ]);
       user = { id, name, disabled: 0 };
@@ -226,12 +227,17 @@ async function oauthCallback(request, env, provider, secure) {
         let status = null, chainError = null;
         try { status = await fetchMinecraftStatus(tokenData.access_token); }
         catch (chainFailure) { chainError = String(chainFailure?.message ?? chainFailure).slice(0, 60); }
-        await env.DB.batch([
+        const statements = [
           env.DB.prepare(`INSERT INTO minecraft_profiles(user_id,owned,profile_id,profile_name,error,checked_at) VALUES(?,?,?,?,?,?)
             ON CONFLICT(user_id) DO UPDATE SET owned=excluded.owned, profile_id=excluded.profile_id, profile_name=excluded.profile_name, error=excluded.error, checked_at=excluded.checked_at`)
             .bind(user.id, status?.owned ?? null, status?.profileId ?? null, status?.profileName ?? null, chainError, new Date().toISOString()),
           auditEvent(env, user.id, 'minecraft.checked', status ? `owned:${status.owned}` : chainError)
-        ]);
+        ];
+        // 刷新令牌仅在配置 TOKEN_ENC_KEY 时以 AES-GCM 加密保存；无密钥则拒绝落盘（绝不存明文）。
+        if (typeof tokenData.refresh_token === 'string' && env.TOKEN_ENC_KEY) {
+          statements.push(env.DB.prepare('INSERT INTO microsoft_tokens(user_id,refresh_token_enc,obtained_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET refresh_token_enc=excluded.refresh_token_enc, obtained_at=excluded.obtained_at').bind(user.id, await encryptSecret(tokenData.refresh_token, env.TOKEN_ENC_KEY), new Date().toISOString()));
+        }
+        await env.DB.batch(statements);
       }
       return new Response(null, { status: 303, headers });
     }
@@ -255,6 +261,10 @@ export async function finalizeAccountDeletion(env, requestId, userId) {
     env.DB.prepare('DELETE FROM sessions WHERE user_id=?').bind(userId),
     env.DB.prepare('DELETE FROM oauth_identities WHERE user_id=?').bind(userId),
     env.DB.prepare('DELETE FROM oauth_states WHERE user_id=?').bind(userId),
+    env.DB.prepare('DELETE FROM microsoft_tokens WHERE user_id=?').bind(userId),
+    env.DB.prepare('DELETE FROM mfa_passkeys WHERE user_id=?').bind(userId),
+    env.DB.prepare('DELETE FROM mfa_totp WHERE user_id=?').bind(userId),
+    env.DB.prepare('DELETE FROM mfa_recovery_codes WHERE user_id=?').bind(userId),
     env.DB.prepare('UPDATE users SET name=?, display_name=NULL, email=NULL, disabled=1 WHERE id=? AND disabled=0').bind('deleted:' + userId, userId),
     env.DB.prepare("UPDATE account_deletion_requests SET state='finalized', finalized_at=?, version=version+1 WHERE id=? AND state='pending'").bind(now, requestId),
     env.DB.prepare('INSERT INTO deletion_tombstones(subject_id,deleted_at,deletion_version,reason) VALUES(?,?,1,?) ON CONFLICT(subject_id) DO UPDATE SET deleted_at=excluded.deleted_at, deletion_version=deletion_tombstones.deletion_version+1').bind(userId, now, 'user_requested'),
@@ -269,7 +279,8 @@ export async function runAuthMaintenance(env) {
     env.DB.prepare('DELETE FROM oauth_states WHERE expires<? OR (consumed=1 AND expires<?)').bind(now, now - 86400000),
     env.DB.prepare('DELETE FROM rate_limits WHERE expires<?').bind(now),
     env.DB.prepare('DELETE FROM login_challenges WHERE expires<?').bind(now - 86400000),
-    env.DB.prepare('DELETE FROM mfa_totp WHERE confirmed=0 AND created_at<?').bind(new Date(now - 900000).toISOString())
+    env.DB.prepare('DELETE FROM mfa_totp WHERE confirmed=0 AND created_at<?').bind(new Date(now - 900000).toISOString()),
+    env.DB.prepare('DELETE FROM users WHERE confirmed_at IS NULL AND created_at<?').bind(new Date(now - 86400000).toISOString())
   ]);
   const due = await env.DB.prepare("SELECT id,user_id FROM account_deletion_requests WHERE state='pending' AND execute_after<=? LIMIT 20").bind(now).all();
   for (const row of due.results) await finalizeAccountDeletion(env, row.id, row.user_id);
@@ -436,7 +447,88 @@ export default {
         const session = await createSession(env, user, 'console', Date.now(), secure);
         return json(env, { ok: true, method, ...(recoveryRemaining !== undefined ? { recovery: { remaining: recoveryRemaining } } : {}), user: { id: user.id, name: user.name } }, 200, { 'set-cookie': session.cookie });
       }
+      // ---------- 注册（用户名 + 用户 ID + 密码，强制 TOTP 确认后生效） ----------
+      if (path === '/auth/v1/register/start' && request.method === 'POST') {
+        const input = await body(request);
+        await rateLimit(env, 'register-ip:' + clientIp(request), 5, 900000, '注册尝试过于频繁，请稍后再试');
+        const terms = await currentPolicy(env, 'terms');
+        if (input?.tos !== terms.version) fail(400, '需要先接受当前版本的服务条款');
+        let handle, name;
+        try { handle = validateHandle(input?.handle); name = validateDisplayName(input?.name); } catch (error) { fail(400, error.message); }
+        let hash; try { hash = await hashPassword(String(input?.password ?? '')); } catch (error) { fail(400, error.message); }
+        const taken = await env.DB.prepare('SELECT 1 FROM users WHERE user_handle=? OR name=?').bind(handle, handle).first();
+        if (taken) fail(409, '该用户 ID 已被占用');
+        const userId = crypto.randomUUID(), totpId = crypto.randomUUID();
+        const secret = randomSecret();
+        const challenge = randomBytes(32).toString('base64url');
+        const nowIso = new Date().toISOString();
+        try {
+          await env.DB.batch([
+            env.DB.prepare('INSERT INTO users(id,name,password_hash,staff,disabled,display_name,developer,user_handle,password_set_at,created_at) VALUES(?,?,?,0,0,?,0,?,?,?)').bind(userId, handle, hash, name, handle, Date.now(), nowIso),
+            env.DB.prepare('INSERT INTO mfa_totp(id,user_id,secret,confirmed,created_at) VALUES(?,?,?,0,?)').bind(totpId, userId, await encryptSecret(secret, env.MFA_ENC_KEY), nowIso),
+            env.DB.prepare("INSERT INTO login_challenges(challenge_hash,user_id,purpose,expires,created_at) VALUES(?,?, 'register', ?, ?)").bind(digest(challenge), userId, Date.now() + 900000, nowIso),
+            auditEvent(env, userId, 'register.started', handle)
+          ]);
+        } catch (error) {
+          if (String(error?.message ?? error).includes('UNIQUE')) fail(409, '该用户 ID 已被占用');
+          throw error;
+        }
+        return json(env, { challenge, handle, name, totp: { secret, otpauthUrl: otpauthUrl(secret, handle) }, expiresIn: 900000 }, 201);
+      }
+      if (path === '/auth/v1/register/confirm' && request.method === 'POST') {
+        const input = await body(request);
+        const row = await consumeChallenge(env, input?.challenge, 'register');
+        const pending = await env.DB.prepare('SELECT id,secret FROM mfa_totp WHERE user_id=? AND confirmed=0').bind(row.user_id).first();
+        if (!pending) fail(400, '注册已失效，请重新开始');
+        const step = await verifyTotp(await decryptSecret(pending.secret, env.MFA_ENC_KEY), String(input?.code ?? ''));
+        if (step === null) fail(400, '验证码不正确');
+        const user = await env.DB.prepare('SELECT id, COALESCE(display_name,name) AS name, disabled, confirmed_at FROM users WHERE id=?').bind(row.user_id).first();
+        if (!user || user.disabled) fail(403, '账户不可用');
+        if (user.confirmed_at) fail(409, '该注册已完成，请直接登录');
+        const nowIso = new Date().toISOString();
+        const [terms, privacy] = await Promise.all([currentPolicy(env, 'terms'), currentPolicy(env, 'privacy')]);
+        await env.DB.batch([
+          env.DB.prepare('UPDATE mfa_totp SET confirmed=1, confirmed_at=?, last_step=? WHERE id=?').bind(nowIso, step, pending.id),
+          env.DB.prepare('UPDATE users SET confirmed_at=? WHERE id=?').bind(nowIso, user.id),
+          env.DB.prepare('INSERT OR IGNORE INTO terms_acceptances(user_id,policy_id,accepted_at) VALUES(?,?,?)').bind(user.id, terms.id, nowIso),
+          env.DB.prepare('INSERT OR IGNORE INTO privacy_notice_receipts(user_id,policy_id,provided_at) VALUES(?,?,?)').bind(user.id, privacy.id, nowIso),
+          auditEvent(env, user.id, 'register.completed', null)
+        ]);
+        const session = await createSession(env, user, 'console', Date.now(), secure);
+        return json(env, { ok: true, user: { id: user.id, name: user.name } }, 200, { 'set-cookie': session.cookie });
+      }
       // ---------- 2FA 因子管理 ----------
+      // 启动器取 Minecraft 令牌：用加密保存的刷新令牌重新派生 XSTS，实时下发短时令牌并刷新档案。
+      if (path === '/auth/v1/minecraft/token' && request.method === 'POST') {
+        const user = await sessionUser(env, request, 'console');
+        await rateLimit(env, 'mctoken:' + user.id, 10, 3600000, '令牌请求过于频繁，请稍后再试');
+        const row = await env.DB.prepare('SELECT refresh_token_enc FROM microsoft_tokens WHERE user_id=?').bind(user.id).first();
+        if (!row) fail(409, '未存储 Microsoft 刷新令牌：请在账户页重新绑定 Microsoft');
+        const config = configFor('microsoft', env);
+        const tokenRes = await fetch(config.token, {
+          method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
+          body: new URLSearchParams({ client_id: config.clientId, client_secret: config.clientSecret, refresh_token: await decryptSecret(row.refresh_token_enc, env.TOKEN_ENC_KEY), grant_type: 'refresh_token', scope: 'XboxLive.signin offline_access' })
+        });
+        const tokenData = await tokenRes.json().catch(() => ({}));
+        if (!tokenRes.ok || !tokenData.access_token) {
+          await auditEvent(env, user.id, 'minecraft.token.failed', `http:${tokenRes.status}`).run();
+          fail(502, 'Microsoft 令牌刷新失败，请重新绑定账户');
+        }
+        if (typeof tokenData.refresh_token === 'string' && env.TOKEN_ENC_KEY) {
+          await env.DB.prepare('UPDATE microsoft_tokens SET refresh_token_enc=?, obtained_at=? WHERE user_id=?').bind(await encryptSecret(tokenData.refresh_token, env.TOKEN_ENC_KEY), new Date().toISOString(), user.id).run();
+        }
+        let status;
+        try { status = await fetchMinecraftStatus(tokenData.access_token); }
+        catch (chainFailure) { fail(502, 'Minecraft 服务暂不可用：' + String(chainFailure?.message ?? chainFailure).slice(0, 40)); }
+        await env.DB.batch([
+          env.DB.prepare(`INSERT INTO minecraft_profiles(user_id,owned,profile_id,profile_name,error,checked_at) VALUES(?,?,?,?,NULL,?)
+            ON CONFLICT(user_id) DO UPDATE SET owned=excluded.owned, profile_id=excluded.profile_id, profile_name=excluded.profile_name, error=NULL, checked_at=excluded.checked_at`)
+            .bind(user.id, status.owned, status.profileId, status.profileName, new Date().toISOString()),
+          auditEvent(env, user.id, 'minecraft.token.issued', `owned:${status.owned}`)
+        ]);
+        if (!status.owned) fail(403, '该 Microsoft 账户未拥有 Minecraft');
+        return json(env, { accessToken: status.accessToken, profileId: status.profileId, profileName: status.profileName, owned: true });
+      }
       if (path === '/auth/v1/mfa/factors' && request.method === 'GET') {
         const user = await sessionUser(env, request, 'console');
         const [passkeys, totpDevices, recovery, passwordRow] = await Promise.all([
@@ -622,7 +714,7 @@ export default {
         if ((count?.n ?? 0) <= 1) fail(400, '至少保留一个登录方式');
         await env.DB.batch([
           env.DB.prepare('DELETE FROM oauth_identities WHERE user_id=? AND provider=?').bind(user.id, identityMatch[1]),
-          ...(identityMatch[1] === 'microsoft' ? [env.DB.prepare('DELETE FROM minecraft_profiles WHERE user_id=?').bind(user.id)] : []),
+          ...(identityMatch[1] === 'microsoft' ? [env.DB.prepare('DELETE FROM minecraft_profiles WHERE user_id=?').bind(user.id), env.DB.prepare('DELETE FROM microsoft_tokens WHERE user_id=?').bind(user.id)] : []),
           auditEvent(env, user.id, 'oauth.unlinked', identityMatch[1])
         ]);
         return json(env, { ok: true });

@@ -59,3 +59,15 @@ and publishes it with the authentication custom domain.
   将拥有状况与档案（UUID/名称）写入 `minecraft_profiles`；不存储任何 Xbox/MC 令牌。
   链路失败不阻塞绑定，错误码记入 `error` 字段并写审计（`minecraft.checked`）。
 - `GET /auth/v1/account/minecraft` — 账户页与启动器共用读取端点；解绑 Microsoft 时级联清除。
+
+## 注册与 Microsoft 令牌保管（migration 0009）
+
+- `POST /auth/v1/register/start` `{name,handle,password,tos}` — 用户名 + 用户 ID + 密码注册，
+  接受当前条款版本为前置；创建未确认账户与待确认 TOTP，返回一次性 challenge 与密钥（15 分钟）。
+  限流：每 IP 5 次/15 分钟；用户 ID 冲突 409。
+- `POST /auth/v1/register/confirm` `{challenge,code}` — 验证 TOTP 后账户生效（confirmed_at）、
+  条款/隐私回执落库并直接签发会话。未完成注册的账户 24 小时后由 cron 级联清理。
+- Microsoft 绑定追加 `offline_access`：刷新令牌以 AES-GCM（`TOKEN_ENC_KEY`）加密存入
+  `microsoft_tokens`；未配置密钥则拒绝落盘。解绑与注销级联清除。
+- `POST /auth/v1/minecraft/token` — 启动器端点：用保管的刷新令牌重新派生 XSTS，
+  实时返回 Minecraft 短时令牌与档案（不存令牌本体），限流 10 次/小时，写审计。
