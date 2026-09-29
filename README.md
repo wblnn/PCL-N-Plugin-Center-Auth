@@ -36,14 +36,16 @@ and publishes it with the authentication custom domain.
 
 ### 2FA 因子管理（需登录）
 
-- `GET /auth/v1/mfa/factors` — 因子清单（passkey 列表 / TOTP 状态 / 恢复码余量 / 是否已设密码）。
-- `POST /auth/v1/mfa/totp/enroll` → `confirm {code}` — 注册验证器应用（secret 可选
-  `MFA_ENC_KEY` AES-GCM 静态加密；15 分钟未确认由 cron 清理）。
+- `GET /auth/v1/mfa/factors` — 因子清单（passkey 列表 / TOTP 设备列表 / 恢复码余量 / 是否已设密码）。
+- `POST /auth/v1/mfa/totp/enroll` → `confirm {id,code,name?}` — 注册验证器应用，**支持多设备**
+  （每账户至多 10 个，各自命名、独立停用；secret 可选 `MFA_ENC_KEY` AES-GCM 静态加密；
+  15 分钟未确认由 cron 清理）。确认时记录时间步，同一窗口的码不可重放。
 - `POST /auth/v1/mfa/passkey/register/options` → `register` — 注册 passkey（attestation
   'none'，每账户至多 10 个）。
-- `POST /auth/v1/mfa/recovery/generate` — 重新生成 10 个一次性恢复码（仅存 SHA-256，明文只返回一次；
-  要求已有 passkey 或 TOTP）。
-- `DELETE /auth/v1/mfa/totp`、`DELETE /auth/v1/mfa/passkey/:credentialId` — 移除因子；
+- `POST /auth/v1/mfa/recovery/generate` — 重新生成 10 个一次性恢复码（要求已有 passkey 或 TOTP）。
+  登录核销仅依据 SHA-256 哈希；同时保存可解密副本（`MFA_ENC_KEY` AES-GCM），供账户主复核后查看。
+- `POST /auth/v1/mfa/recovery/reveal` — 身份复核后返回未使用的恢复码明文（用于查看/打印），写审计。
+- `DELETE /auth/v1/mfa/totp/:id`、`DELETE /auth/v1/mfa/passkey/:credentialId` — 移除单个因子；
   已设密码时要求复核当前密码，且必须保留至少一种因子。
 
 部署顺序：先 `wrangler d1 migrations apply pcln-production --remote`，再 `wrangler deploy`。

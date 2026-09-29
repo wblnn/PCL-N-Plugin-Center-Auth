@@ -44,15 +44,15 @@ async function rateLimit(env, key, limit, windowMs, message) {
 }
 async function loadFactors(env, userId) {
   const [totp, passkeys, recovery] = await Promise.all([
-    env.DB.prepare('SELECT secret, confirmed, last_step FROM mfa_totp WHERE user_id=? AND confirmed=1').bind(userId).first(),
+    env.DB.prepare('SELECT count(*) AS n FROM mfa_totp WHERE user_id=? AND confirmed=1').bind(userId).first(),
     env.DB.prepare('SELECT count(*) AS n FROM mfa_passkeys WHERE user_id=?').bind(userId).first(),
     env.DB.prepare('SELECT count(*) AS n FROM mfa_recovery_codes WHERE user_id=? AND used_at IS NULL').bind(userId).first()
   ]);
   return {
-    totp: totp ?? null,
+    totpCount: totp?.n ?? 0,
     passkeyCount: passkeys?.n ?? 0,
     recoveryCount: recovery?.n ?? 0,
-    list: [...(passkeys?.n ? ['passkey'] : []), ...(totp ? ['totp'] : []), ...(recovery?.n ? ['recovery'] : [])]
+    list: [...(passkeys?.n ? ['passkey'] : []), ...(totp?.n ? ['totp'] : []), ...(recovery?.n ? ['recovery'] : [])]
   };
 }
 async function createLoginChallenge(env, userId, purpose = 'login') {
@@ -366,10 +366,10 @@ export default {
         if (!user || user.disabled) fail(403, '账户已被停用');
         const code = String(input?.code ?? '');
         let method = null, recoveryRemaining;
-        const totpRow = await env.DB.prepare('SELECT secret, last_step FROM mfa_totp WHERE user_id=? AND confirmed=1').bind(row.user_id).first();
-        if (totpRow) {
-          const step = await verifyTotp(await decryptSecret(totpRow.secret, env.MFA_ENC_KEY), code, Date.now(), totpRow.last_step);
-          if (step !== null) { method = 'totp'; await env.DB.prepare('UPDATE mfa_totp SET last_step=? WHERE user_id=?').bind(step, row.user_id).run(); }
+        const totpDevices = await env.DB.prepare('SELECT id,secret,last_step FROM mfa_totp WHERE user_id=? AND confirmed=1').bind(row.user_id).all();
+        for (const device of totpDevices.results) {
+          const step = await verifyTotp(await decryptSecret(device.secret, env.MFA_ENC_KEY), code, Date.now(), device.last_step);
+          if (step !== null) { method = 'totp'; await env.DB.prepare('UPDATE mfa_totp SET last_step=? WHERE id=?').bind(step, device.id).run(); break; }
         }
         if (!method && /^[A-Za-z0-9-]{5,}$/.test(code.trim())) {
           const consumedCode = await env.DB.prepare('UPDATE mfa_recovery_codes SET used_at=? WHERE code_hash=? AND user_id=? AND used_at IS NULL').bind(new Date().toISOString(), hashRecoveryCode(code), row.user_id).run();
@@ -387,48 +387,56 @@ export default {
       // ---------- 2FA 因子管理 ----------
       if (path === '/auth/v1/mfa/factors' && request.method === 'GET') {
         const user = await sessionUser(env, request, 'console');
-        const [passkeys, totp, recovery, passwordRow] = await Promise.all([
+        const [passkeys, totpDevices, recovery, passwordRow] = await Promise.all([
           env.DB.prepare('SELECT credential_id, name, created_at, last_used_at FROM mfa_passkeys WHERE user_id=? ORDER BY created_at').bind(user.id).all(),
-          env.DB.prepare('SELECT confirmed, created_at, confirmed_at FROM mfa_totp WHERE user_id=?').bind(user.id).first(),
+          env.DB.prepare('SELECT id, name, confirmed, created_at, confirmed_at FROM mfa_totp WHERE user_id=? ORDER BY created_at').bind(user.id).all(),
           env.DB.prepare('SELECT count(*) AS n FROM mfa_recovery_codes WHERE user_id=? AND used_at IS NULL').bind(user.id).first(),
           env.DB.prepare('SELECT password_set_at FROM users WHERE id=?').bind(user.id).first()
         ]);
         return json(env, {
           passwordSet: Boolean(passwordRow?.password_set_at),
           passkeys: passkeys.results.map(p => ({ credentialId: p.credential_id, name: p.name, createdAt: p.created_at, lastUsedAt: p.last_used_at })),
-          totp: totp ? { confirmed: Boolean(totp.confirmed), createdAt: totp.created_at, confirmedAt: totp.confirmed_at } : null,
+          totp: totpDevices.results.map(t => ({ id: t.id, name: t.name, confirmed: Boolean(t.confirmed), createdAt: t.created_at, confirmedAt: t.confirmed_at })),
           recovery: { count: recovery?.n ?? 0 }
         });
       }
       if (path === '/auth/v1/mfa/totp/enroll' && request.method === 'POST') {
         const user = await sessionUser(env, request, 'console');
+        const cap = await env.DB.prepare('SELECT count(*) AS n FROM mfa_totp WHERE user_id=?').bind(user.id).first();
+        if ((cap?.n ?? 0) >= 10) fail(400, '最多注册 10 个验证器');
+        const id = crypto.randomUUID();
         const secret = randomSecret();
         const account = await env.DB.prepare('SELECT user_handle, COALESCE(display_name,name) AS name FROM users WHERE id=?').bind(user.id).first();
-        await env.DB.prepare('INSERT INTO mfa_totp(user_id,secret,confirmed,created_at) VALUES(?,?,0,?) ON CONFLICT(user_id) DO UPDATE SET secret=excluded.secret, confirmed=0, last_step=NULL, created_at=excluded.created_at, confirmed_at=NULL').bind(user.id, await encryptSecret(secret, env.MFA_ENC_KEY), new Date().toISOString()).run();
-        return json(env, { secret, otpauthUrl: otpauthUrl(secret, account?.user_handle || account?.name || 'user'), expiresAt: new Date(Date.now() + 900000).toISOString() }, 201);
+        await env.DB.prepare('INSERT INTO mfa_totp(id,user_id,secret,confirmed,created_at) VALUES(?,?,?,0,?)').bind(id, user.id, await encryptSecret(secret, env.MFA_ENC_KEY), new Date().toISOString()).run();
+        return json(env, { id, secret, otpauthUrl: otpauthUrl(secret, account?.user_handle || account?.name || 'user'), expiresAt: new Date(Date.now() + 900000).toISOString() }, 201);
       }
       if (path === '/auth/v1/mfa/totp/confirm' && request.method === 'POST') {
         const user = await sessionUser(env, request, 'console');
         const input = await body(request);
-        const row = await env.DB.prepare('SELECT secret, created_at FROM mfa_totp WHERE user_id=? AND confirmed=0').bind(user.id).first();
+        const row = await env.DB.prepare('SELECT id,secret,created_at FROM mfa_totp WHERE id=? AND user_id=? AND confirmed=0').bind(String(input?.id ?? ''), user.id).first();
         if (!row) fail(400, '请先发起注册');
         if (Date.now() - Date.parse(row.created_at) > 900000) fail(400, '注册已超时，请重新发起');
         const step = await verifyTotp(await decryptSecret(row.secret, env.MFA_ENC_KEY), String(input?.code ?? ''));
         if (step === null) fail(400, '验证码不正确');
+        const name = typeof input?.name === 'string' && input.name.trim() ? input.name.trim().slice(0, 60) : null;
         await env.DB.batch([
-          env.DB.prepare('UPDATE mfa_totp SET confirmed=1, confirmed_at=?, last_step=? WHERE user_id=?').bind(new Date().toISOString(), step, user.id),
-          auditEvent(env, user.id, 'mfa.totp.enabled', null)
+          env.DB.prepare('UPDATE mfa_totp SET confirmed=1, confirmed_at=?, last_step=?, name=COALESCE(?,name) WHERE id=? AND user_id=?').bind(new Date().toISOString(), step, name, row.id, user.id),
+          auditEvent(env, user.id, 'mfa.totp.enabled', name)
         ]);
-        return json(env, { ok: true });
+        return json(env, { ok: true, id: row.id });
       }
-      if (path === '/auth/v1/mfa/totp' && request.method === 'DELETE') {
+      const totpDelete = path.match(/^\/auth\/v1\/mfa\/totp\/([A-Za-z0-9-]+)$/);
+      if (totpDelete && request.method === 'DELETE') {
         const user = await sessionUser(env, request, 'console');
         const input = await body(request).catch(() => ({}));
         await reauthSensitive(env, user, input);
         const factors = await loadFactors(env, user.id);
         const passwordRow = await env.DB.prepare('SELECT password_set_at FROM users WHERE id=?').bind(user.id).first();
-        if (passwordRow?.password_set_at && !factors.passkeyCount && !factors.recoveryCount) fail(400, '密码登录必须保留至少一种两步验证方式，请先注册其他方式');
-        await env.DB.batch([env.DB.prepare('DELETE FROM mfa_totp WHERE user_id=?').bind(user.id), auditEvent(env, user.id, 'mfa.totp.disabled', null)]);
+        const remaining = factors.passkeyCount + factors.recoveryCount + Math.max(0, factors.totpCount - 1);
+        if (passwordRow?.password_set_at && remaining === 0) fail(400, '密码登录必须保留至少一种两步验证方式，请先注册其他方式');
+        const deleted = await env.DB.prepare('DELETE FROM mfa_totp WHERE id=? AND user_id=?').bind(totpDelete[1], user.id).run();
+        if (!deleted.meta.changes) fail(404, '验证器不存在');
+        await auditEvent(env, user.id, 'mfa.totp.disabled', totpDelete[1]).run();
         return json(env, { ok: true });
       }
       if (path === '/auth/v1/mfa/passkey/register/options' && request.method === 'POST') {
@@ -493,15 +501,28 @@ export default {
         const input = await body(request).catch(() => ({}));
         await reauthSensitive(env, user, input);
         const factors = await loadFactors(env, user.id);
-        if (!factors.totp && !factors.passkeyCount) fail(400, '请先注册 passkey 或验证器应用，再生成恢复码');
+        if (!factors.totpCount && !factors.passkeyCount) fail(400, '请先注册 passkey 或验证器应用，再生成恢复码');
         const codes = generateRecoveryCodes(10);
         const now = new Date().toISOString();
         await env.DB.batch([
           env.DB.prepare('DELETE FROM mfa_recovery_codes WHERE user_id=? AND used_at IS NULL').bind(user.id),
-          ...codes.map(code => env.DB.prepare('INSERT INTO mfa_recovery_codes(code_hash,user_id,created_at) VALUES(?,?,?)').bind(hashRecoveryCode(code), user.id, now)),
+          ...(await Promise.all(codes.map(async code => env.DB.prepare('INSERT INTO mfa_recovery_codes(code_hash,user_id,code_store,created_at) VALUES(?,?,?,?)').bind(hashRecoveryCode(code), user.id, await encryptSecret(code, env.MFA_ENC_KEY), now)))),
           auditEvent(env, user.id, 'mfa.recovery.generated', String(codes.length))
         ]);
-        return json(env, { codes, note: '恢复码为一次性使用，仅此一次完整展示，请立即妥善保存。' }, 201);
+        return json(env, { codes, note: '恢复码为一次性使用，可稍后在账户页复核身份后再次查看。' }, 201);
+      }
+      if (path === '/auth/v1/mfa/recovery/reveal' && request.method === 'POST') {
+        const user = await sessionUser(env, request, 'console');
+        const input = await body(request).catch(() => ({}));
+        await reauthSensitive(env, user, input);
+        const rows = await env.DB.prepare('SELECT code_store, used_at FROM mfa_recovery_codes WHERE user_id=? AND used_at IS NULL ORDER BY rowid').bind(user.id).all();
+        const codes = [];
+        for (const row of rows.results) {
+          if (row.code_store === null || row.code_store === undefined) continue;
+          try { codes.push(await decryptSecret(row.code_store, env.MFA_ENC_KEY)); } catch { /* 密钥变更导致不可解密的旧码跳过 */ }
+        }
+        await auditEvent(env, user.id, 'mfa.recovery.revealed', String(codes.length)).run();
+        return json(env, { codes, missing: rows.results.length - codes.length });
       }
       if (path === '/auth/v1/policies/accept' && request.method === 'POST') {
         const user = await sessionUser(env, request, 'console');
