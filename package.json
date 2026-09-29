@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "wrangler dev --env local --port 5733",
     "check": "wrangler deploy --dry-run",
+    "test": "node --test tests/",
     "types": "wrangler types",
     "deploy": "wrangler deploy"
   },
