@@ -128,7 +128,7 @@ async function currentPolicy(env, kind) {
 async function sessionUser(env, request, scope) {
   const value = credential(request, scope);
   if (!value) fail(401, '请先登录');
-  const user = await env.DB.prepare(`SELECT u.id,COALESCE(u.display_name,u.name) AS name,u.email,u.staff,u.developer,u.user_handle AS handle,
+  const user = await env.DB.prepare(`SELECT u.id,COALESCE(u.display_name,u.name) AS name,u.email,u.staff,u.developer,u.user_handle AS handle,(u.confirmed_at IS NULL) AS setupRequired,
     EXISTS(SELECT 1 FROM terms_acceptances ta JOIN policy_documents pd ON pd.id=ta.policy_id AND pd.kind='terms' AND pd.current=1 WHERE ta.user_id=u.id) AS termsAccepted
     FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.scope=? AND s.expires>? AND u.disabled=0 AND (?=0 OR u.staff=1)`).bind(digest(value), scope, Date.now(), scope === 'operations' ? 1 : 0).first();
   if (!user) fail(401, '请先登录');
@@ -207,14 +207,15 @@ async function oauthCallback(request, env, provider, secure) {
         ]);
       }
     } else if (identity) {
-      user = await env.DB.prepare('SELECT id,name,disabled FROM users WHERE id=?').bind(identity.user_id).first();
+      user = await env.DB.prepare('SELECT id,name,disabled,confirmed_at FROM users WHERE id=?').bind(identity.user_id).first();
     } else {
       const id = crypto.randomUUID(), name = `${provider}:${subject}`;
       await env.DB.batch([
-        env.DB.prepare("INSERT INTO users(id,name,password_hash,display_name,email,created_at,confirmed_at) VALUES(?,?,?,?,?,?,?)").bind(id, name, `oauth:${randomBytes(32).toString('hex')}`, displayName, email, new Date().toISOString(), new Date().toISOString()),
+        // 新用户 confirmed_at 留空:必须到 /register?setup=1 完善用户名/用户 ID 后账户才生效。
+        env.DB.prepare("INSERT INTO users(id,name,password_hash,display_name,email,created_at) VALUES(?,?,?,?,?,?)").bind(id, name, `oauth:${randomBytes(32).toString('hex')}`, displayName, email, new Date().toISOString()),
         env.DB.prepare('INSERT INTO oauth_identities(provider,subject,user_id,email,created_at,updated_at) VALUES(?,?,?,?,?,?)').bind(provider, subject, id, email, new Date().toISOString(), new Date().toISOString())
       ]);
-      user = { id, name, disabled: 0 };
+      user = { id, name, disabled: 0, confirmed_at: null };
     }
     if (!user || user.disabled) throw new Error('account disabled');
     await env.DB.prepare('UPDATE oauth_identities SET email=?,updated_at=? WHERE provider=? AND subject=?').bind(email, new Date().toISOString(), provider, subject).run();
@@ -252,6 +253,8 @@ async function oauthCallback(request, env, provider, secure) {
     }
     const session = await createSession(env, user, 'console', now, secure);
     headers.append('set-cookie', session.cookie);
+    // 未完成注册的用户强制进入完善资料页;已确认用户按 return_to 回跳。
+    if (!user.confirmed_at) headers.set('location', new URL('/register?setup=1', env.WEB_ORIGIN).toString());
     return new Response(null, { status: 303, headers });
   } catch (error) { console.error(JSON.stringify({ oauth: provider, error: error.name })); return oauthError(env, '第三方登录失败，请重试'); }
 }
@@ -450,59 +453,36 @@ export default {
         const session = await createSession(env, user, 'console', Date.now(), secure);
         return json(env, { ok: true, method, ...(recoveryRemaining !== undefined ? { recovery: { remaining: recoveryRemaining } } : {}), user: { id: user.id, name: user.name } }, 200, { 'set-cookie': session.cookie });
       }
-      // ---------- 注册（用户名 + 用户 ID + 密码，强制 TOTP 确认后生效） ----------
-      if (path === '/auth/v1/register/start' && request.method === 'POST') {
+      // ---------- 注册完善：第三方身份验证后设置用户名 / 用户 ID /（可选）密码 + TOTP ----------
+      if (path === '/auth/v1/register/complete' && request.method === 'POST') {
+        const user = await sessionUser(env, request, 'console');
+        const row = await env.DB.prepare('SELECT id, confirmed_at, email FROM users WHERE id=?').bind(user.id).first();
+        if (!row) fail(404, '账户不存在');
+        if (row.confirmed_at) fail(409, '账户已激活，请在账户页修改相关设置');
         const input = await body(request);
-        await rateLimit(env, 'register-ip:' + clientIp(request), 5, 900000, '注册尝试过于频繁，请稍后再试');
-        const terms = await currentPolicy(env, 'terms');
-        if (input?.tos !== terms.version) fail(400, '需要先接受当前版本的服务条款');
         let handle, name;
         try { handle = validateHandle(input?.handle); name = validateDisplayName(input?.name); } catch (error) { fail(400, error.message); }
-        let hash; try { hash = await hashPassword(String(input?.password ?? '')); } catch (error) { fail(400, error.message); }
-        // 同 handle 的废弃未确认注册先级联清理，允许用户重新开始注册。
-        await env.DB.prepare('DELETE FROM users WHERE user_handle=? AND confirmed_at IS NULL').bind(handle).run();
-        const taken = await env.DB.prepare('SELECT 1 FROM users WHERE user_handle=? OR name=?').bind(handle, handle).first();
+        // 回收他人废弃的未确认同名注册；再检查已确认账户占用。
+        await env.DB.prepare('DELETE FROM users WHERE (user_handle=? OR name=?) AND confirmed_at IS NULL AND id!=?').bind(handle, handle, user.id).run();
+        const taken = await env.DB.prepare('SELECT 1 FROM users WHERE (user_handle=? OR name=?) AND id!=?').bind(handle, handle, user.id).first();
         if (taken) fail(409, '该用户 ID 已被占用');
-        const userId = crypto.randomUUID(), totpId = crypto.randomUUID();
-        const secret = randomSecret();
-        const challenge = randomBytes(32).toString('base64url');
-        const nowIso = new Date().toISOString();
-        try {
-          await env.DB.batch([
-            env.DB.prepare('INSERT INTO users(id,name,password_hash,staff,disabled,display_name,developer,user_handle,password_set_at,created_at) VALUES(?,?,?,0,0,?,0,?,?,?)').bind(userId, handle, hash, name, handle, Date.now(), nowIso),
-            env.DB.prepare('INSERT INTO mfa_totp(id,user_id,secret,confirmed,created_at) VALUES(?,?,?,0,?)').bind(totpId, userId, await encryptSecret(secret, env.MFA_ENC_KEY), nowIso),
-            env.DB.prepare("INSERT INTO login_challenges(challenge_hash,user_id,purpose,expires,created_at) VALUES(?,?, 'register', ?, ?)").bind(digest(challenge), userId, Date.now() + 900000, nowIso),
-            auditEvent(env, userId, 'register.started', handle)
-          ]);
-        } catch (error) {
-          if (String(error?.message ?? error).includes('UNIQUE')) fail(409, '该用户 ID 已被占用');
-          throw error;
+        const password = typeof input?.password === 'string' && input.password ? input.password : null;
+        let hash = null, totpRow = null, step = null;
+        if (password) {
+          try { hash = await hashPassword(password); } catch (error) { fail(400, error.message); }
+          totpRow = await env.DB.prepare('SELECT id,secret FROM mfa_totp WHERE id=? AND user_id=? AND confirmed=0').bind(String(input?.totpId ?? ''), user.id).first();
+          if (!totpRow) fail(400, '设置密码需要先完成验证器绑定');
+          step = await verifyTotp(await decryptSecret(totpRow.secret, env.MFA_ENC_KEY), String(input?.totpCode ?? ''));
+          if (step === null) fail(400, '动态码不正确');
         }
-        return json(env, { challenge, handle, name, totp: { secret, otpauthUrl: otpauthUrl(secret, handle) }, expiresIn: 900000 }, 201);
-      }
-      if (path === '/auth/v1/register/confirm' && request.method === 'POST') {
-        const input = await body(request);
-        const row = await loadChallenge(env, input?.challenge, 'register');
-        const pending = await env.DB.prepare('SELECT id,secret FROM mfa_totp WHERE user_id=? AND confirmed=0').bind(row.user_id).first();
-        if (!pending) fail(400, '注册已失效，请重新开始');
-        const step = await verifyTotp(await decryptSecret(pending.secret, env.MFA_ENC_KEY), String(input?.code ?? ''));
-        if (step === null) fail(400, '验证码不正确');
-        const user = await env.DB.prepare('SELECT id, COALESCE(display_name,name) AS name, disabled, confirmed_at FROM users WHERE id=?').bind(row.user_id).first();
-        if (!user || user.disabled) fail(403, '账户不可用');
-        if (user.confirmed_at) fail(409, '该注册已完成，请直接登录');
-        const consumedRow = await env.DB.prepare('UPDATE login_challenges SET consumed=1 WHERE challenge_hash=? AND consumed=0').bind(row.challenge_hash).run();
-        if (!consumedRow.meta.changes) fail(409, '该注册确认已被使用');
         const nowIso = new Date().toISOString();
-        const [terms, privacy] = await Promise.all([currentPolicy(env, 'terms'), currentPolicy(env, 'privacy')]);
         await env.DB.batch([
-          env.DB.prepare('UPDATE mfa_totp SET confirmed=1, confirmed_at=?, last_step=? WHERE id=?').bind(nowIso, step, pending.id),
-          env.DB.prepare('UPDATE users SET confirmed_at=? WHERE id=?').bind(nowIso, user.id),
-          env.DB.prepare('INSERT OR IGNORE INTO terms_acceptances(user_id,policy_id,accepted_at) VALUES(?,?,?)').bind(user.id, terms.id, nowIso),
-          env.DB.prepare('INSERT OR IGNORE INTO privacy_notice_receipts(user_id,policy_id,provided_at) VALUES(?,?,?)').bind(user.id, privacy.id, nowIso),
-          auditEvent(env, user.id, 'register.completed', null)
+          env.DB.prepare('UPDATE users SET display_name=?, user_handle=?, confirmed_at=?, password_hash=COALESCE(?,password_hash), password_set_at=CASE WHEN ? IS NULL THEN password_set_at ELSE ? END WHERE id=?').bind(name, handle, nowIso, hash, hash, Date.now(), user.id),
+          ...(totpRow ? [env.DB.prepare('UPDATE mfa_totp SET confirmed=1, confirmed_at=?, last_step=? WHERE id=?').bind(nowIso, step, totpRow.id)] : []),
+          auditEvent(env, user.id, 'register.completed', `handle:${handle};password:${hash ? 'set' : 'skip'}`)
         ]);
-        const session = await createSession(env, user, 'console', Date.now(), secure);
-        return json(env, { ok: true, user: { id: user.id, name: user.name } }, 200, { 'set-cookie': session.cookie });
+        if (row.email) later(mailer.securityNotice(row.email, `你的账户已完成注册，用户 ID：${handle}。`));
+        return json(env, { ok: true, handle, name, passwordSet: Boolean(hash) });
       }
       // ---------- 2FA 因子管理 ----------
       // 启动器取 Minecraft 令牌：用加密保存的刷新令牌重新派生 XSTS，实时下发短时令牌并刷新档案。

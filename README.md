@@ -62,11 +62,13 @@ and publishes it with the authentication custom domain.
 
 ## 注册与 Microsoft 令牌保管（migration 0009）
 
-- `POST /auth/v1/register/start` `{name,handle,password,tos}` — 用户名 + 用户 ID + 密码注册，
-  接受当前条款版本为前置；创建未确认账户与待确认 TOTP，返回一次性 challenge 与密钥（15 分钟）。
-  限流：每 IP 5 次/15 分钟；用户 ID 冲突 409。
-- `POST /auth/v1/register/confirm` `{challenge,code}` — 验证 TOTP 后账户生效（confirmed_at）、
-  条款/隐私回执落库并直接签发会话。未完成注册的账户 24 小时后由 cron 级联清理。
+- **注册必须经第三方身份验证**（GitHub / Google / Microsoft）。OAuth 首登创建的账户
+  `confirmed_at` 为空（未激活），回调后强制重定向 `/register?setup=1` 完善资料；
+  24 小时未完善的账户由 cron 级联清理。会话响应携带 `setupRequired` 标记。
+- `POST /auth/v1/register/complete` `{name,handle,password?,totpId?,totpCode?}` —
+  仅未激活账户可用：设置用户名与用户 ID（唯一性校验、回收他人废弃同名注册）；
+  **设置密码时必须同时完成验证器绑定**（密码 ⇔ 2FA 不变量），成功后账户激活。
+  不提供纯密码直连注册。
 - Microsoft 绑定追加 `offline_access`：刷新令牌以 AES-GCM（`TOKEN_ENC_KEY`）加密存入
   `microsoft_tokens`；未配置密钥则拒绝落盘。解绑与注销级联清除。
 - `POST /auth/v1/minecraft/token` — 启动器端点：用保管的刷新令牌重新派生 XSTS，
