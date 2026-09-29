@@ -228,7 +228,8 @@ export default {
   async fetch(request, env, ctx) {
     const id = crypto.randomUUID(), url = new URL(request.url), path = url.pathname;
     const mailer = createMailer(env);
-    const later = task => { if (ctx?.waitUntil) ctx.waitUntil(task.catch(() => {})); };
+    // 邮件等旁路任务：未配置服务商时 mailer 可能返回非 Promise，统一包裹后再 waitUntil。
+    const later = task => { if (ctx?.waitUntil) ctx.waitUntil(Promise.resolve(task).catch(() => {})); };
     try {
       const secure = env.LOCAL_DEV !== 'true';
       if (!env.WEB_ORIGIN || (secure && !env.WEB_ORIGIN.startsWith('https://'))) fail(503, '身份服务尚未配置');
