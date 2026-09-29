@@ -28,7 +28,41 @@ const configFor = (provider, env) => {
   return config;
 };
 const b64json = value => JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(value.replaceAll('-', '+').replaceAll('_', '/') + '='.repeat((4 - value.length % 4) % 4)), c => c.charCodeAt(0))));
-const oauthError = (env, detail) => Response.redirect(`${env.WEB_ORIGIN}/account?oauth_error=${encodeURIComponent(detail)}`, 303);
+// Microsoft 绑定专用：用带 XboxLive.signin 的 MSA 令牌走 XBL → XSTS → Minecraft 服务，
+// 查询游戏拥有状况与档案（id/name）。只存结果，不存任何 Xbox/MC 令牌。
+async function fetchMinecraftStatus(accessToken) {
+  const signal = AbortSignal.timeout(12000);
+  const postJson = async (url, body) => {
+    const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' }, body: JSON.stringify(body), signal });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.XErr ? `xbl:${data.XErr}` : `http:${res.status}`);
+    return data;
+  };
+  const xbl = await postJson('https://user.auth.microsoftonline.com/authenticate', {
+    RelyingParty: 'http://auth.xboxlive.com', TokenType: 'JWT',
+    Properties: { AuthMethod: 'RPS', SiteName: 'user.auth.microsoftonline.com', RpsTicket: 'd=' + accessToken }
+  });
+  const xsts = await postJson('https://xsts.auth.xboxlive.com/xsts/authorize', {
+    RelyingParty: 'rp://http://minecraft.net/production', TokenType: 'JWT',
+    Properties: { SandboxId: 'RETAIL', UserTokens: [xbl.Token], SiteName: 'user.auth.microsoftonline.com' }
+  });
+  const uhs = xsts?.DisplayClaims?.xui?.[0]?.uhs ?? xbl?.DisplayClaims?.xui?.[0]?.uhs;
+  const mcAuth = { Authorization: `XBL3.0 x=${uhs};${xsts.Token}`, Accept: 'application/json' };
+  const entRes = await fetch('https://api.minecraftservices.com/entitlements/mcstore', { headers: mcAuth, signal });
+  if (!entRes.ok) throw new Error('http:' + entRes.status);
+  const ent = await entRes.json().catch(() => ({}));
+  const owned = Array.isArray(ent?.items) && ent.items.some(item => item?.name === 'product_minecraft' || item?.name === 'game_minecraft');
+  let profileId = null, profileName = null;
+  if (owned) {
+    const profRes = await fetch('https://api.minecraftservices.com/minecraft/profile', { headers: mcAuth, signal });
+    if (profRes.ok) {
+      const prof = await profRes.json().catch(() => ({}));
+      if (typeof prof?.id === 'string') { profileId = prof.id; profileName = typeof prof.name === 'string' ? prof.name.slice(0, 32) : null; }
+    }
+  }
+  return { owned: owned ? 1 : 0, profileId, profileName };
+}
+const oauthError = (env, detail) => Response.redirect(`${env.WEB_ORIGIN}/login?oauth_error=${encodeURIComponent(detail)}`, 303);
 const auditEvent = (env, actor, action, detail) => env.DB.prepare('INSERT INTO auth_audit(actor,action,created_at,detail) VALUES(?,?,?,?)').bind(actor, action, new Date().toISOString(), detail ?? null);
 // 仅在前一条语句（INSERT OR IGNORE）实际写入时记录，用于条款首次接受等幂等事件。
 const auditOnChange = (env, actor, action, detail) => env.DB.prepare('INSERT INTO auth_audit(actor,action,created_at,detail) SELECT ?,?,?,? WHERE changes()=1').bind(actor, action, new Date().toISOString(), detail ?? null);
@@ -130,7 +164,10 @@ async function oauthStart(request, env, provider) {
   ]);
   const authorize = new URL(config.authorize);
   authorize.searchParams.set('client_id', config.clientId); authorize.searchParams.set('redirect_uri', config.callback); authorize.searchParams.set('response_type', 'code'); authorize.searchParams.set('state', state);
-  authorize.searchParams.set('scope', config.scope); authorize.searchParams.set('nonce', nonce);
+  // Microsoft 仅在“绑定”时额外请求 XboxLive.signin：用于查询 Minecraft 拥有状况与档案，
+  // 供启动器自动添加游戏档案；普通登录保持最小 scope（与 7307a22 的收窄一致）。
+  authorize.searchParams.set('scope', provider === 'microsoft' && mode === 'link' ? `${config.scope} XboxLive.signin` : config.scope);
+  authorize.searchParams.set('nonce', nonce);
   return new Response(null, { status: 302, headers: { location: authorize.toString(), 'set-cookie': `${oauthStateCookie}=${state}; HttpOnly; SameSite=Lax; Path=/auth/v1/oauth; Max-Age=600${env.LOCAL_DEV === 'true' ? '' : '; Secure'}`, 'cache-control': 'no-store' } });
 }
 async function oauthCallback(request, env, provider, secure) {
@@ -182,7 +219,22 @@ async function oauthCallback(request, env, provider, secure) {
     await env.DB.prepare('UPDATE oauth_identities SET email=?,updated_at=? WHERE provider=? AND subject=?').bind(email, new Date().toISOString(), provider, subject).run();
     const headers = new Headers({ location: new URL(stateRow.return_to, env.WEB_ORIGIN).toString(), 'cache-control': 'no-store' });
     headers.append('set-cookie', `${oauthStateCookie}=; HttpOnly; SameSite=Lax; Path=/auth/v1/oauth; Max-Age=0${secure ? '; Secure' : ''}`);
-    if (stateRow.user_id) return new Response(null, { status: 303, headers });
+    if (stateRow.user_id) {
+      // 绑定 Microsoft 成功：同步查询 Xbox → Minecraft 拥有状况与档案并落库。
+      // 任何一步失败都不阻塞绑定本身，只记录 error 供界面展示。
+      if (provider === 'microsoft') {
+        let status = null, chainError = null;
+        try { status = await fetchMinecraftStatus(tokenData.access_token); }
+        catch (chainFailure) { chainError = String(chainFailure?.message ?? chainFailure).slice(0, 60); }
+        await env.DB.batch([
+          env.DB.prepare(`INSERT INTO minecraft_profiles(user_id,owned,profile_id,profile_name,error,checked_at) VALUES(?,?,?,?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET owned=excluded.owned, profile_id=excluded.profile_id, profile_name=excluded.profile_name, error=excluded.error, checked_at=excluded.checked_at`)
+            .bind(user.id, status?.owned ?? null, status?.profileId ?? null, status?.profileName ?? null, chainError, new Date().toISOString()),
+          auditEvent(env, user.id, 'minecraft.checked', status ? `owned:${status.owned}` : chainError)
+        ]);
+      }
+      return new Response(null, { status: 303, headers });
+    }
     await env.DB.prepare('UPDATE users SET display_name=?,email=? WHERE id=?').bind(displayName, email, user.id).run();
     if (stateRow.terms_policy_id) {
       // 条款接受与隐私告知随登录原子落库；INSERT OR IGNORE 保证已接受用户不会重复记录。
@@ -547,6 +599,22 @@ export default {
         const rows = await env.DB.prepare('SELECT provider,email,created_at FROM oauth_identities WHERE user_id=? ORDER BY created_at').bind(user.id).all();
         return json(env, { identities: rows.results });
       }
+      // Minecraft 拥有状况与档案：启动器与账户页共用（绑定 Microsoft 时写入）。
+      if (path === '/auth/v1/account/minecraft' && request.method === 'GET') {
+        const user = await sessionUser(env, request, 'console');
+        const [identity, profile] = await Promise.all([
+          env.DB.prepare("SELECT 1 AS linked FROM oauth_identities WHERE user_id=? AND provider='microsoft'").bind(user.id).first(),
+          env.DB.prepare('SELECT owned, profile_id, profile_name, error, checked_at FROM minecraft_profiles WHERE user_id=?').bind(user.id).first()
+        ]);
+        return json(env, {
+          microsoftLinked: Boolean(identity),
+          owned: profile?.owned ?? null,
+          profileId: profile?.profile_id ?? null,
+          profileName: profile?.profile_name ?? null,
+          error: profile?.error ?? null,
+          checkedAt: profile?.checked_at ?? null
+        });
+      }
       const identityMatch = path.match(/^\/auth\/v1\/identities\/(github|microsoft|google)$/);
       if (identityMatch && request.method === 'DELETE') {
         const user = await sessionUser(env, request, 'console');
@@ -554,6 +622,7 @@ export default {
         if ((count?.n ?? 0) <= 1) fail(400, '至少保留一个登录方式');
         await env.DB.batch([
           env.DB.prepare('DELETE FROM oauth_identities WHERE user_id=? AND provider=?').bind(user.id, identityMatch[1]),
+          ...(identityMatch[1] === 'microsoft' ? [env.DB.prepare('DELETE FROM minecraft_profiles WHERE user_id=?').bind(user.id)] : []),
           auditEvent(env, user.id, 'oauth.unlinked', identityMatch[1])
         ]);
         return json(env, { ok: true });
@@ -586,19 +655,21 @@ export default {
       }
       if (path === '/auth/v1/account/export' && request.method === 'GET') {
         const user = await sessionUser(env, request, 'console');
-        const [identities, sessions, acceptances, deletion, privacy, mfa] = await Promise.all([
+        const [identities, sessions, acceptances, deletion, privacy, mfa, minecraft] = await Promise.all([
           env.DB.prepare('SELECT provider,subject,email,created_at,updated_at FROM oauth_identities WHERE user_id=?').bind(user.id).all(),
           env.DB.prepare("SELECT scope, CASE WHEN expires>? THEN 'active' ELSE 'expired' END AS state FROM sessions WHERE user_id=?").bind(Date.now(), user.id).all(),
           env.DB.prepare('SELECT pd.kind,pd.version,ta.accepted_at AS acceptedAt FROM terms_acceptances ta JOIN policy_documents pd ON pd.id=ta.policy_id WHERE ta.user_id=?').bind(user.id).all(),
           env.DB.prepare('SELECT id,state,requested_at AS requestedAt,execute_after AS executeAfter,cancelled_at AS cancelledAt,finalized_at AS finalizedAt FROM account_deletion_requests WHERE user_id=?').bind(user.id).first(),
           env.DB.prepare('SELECT id,request_type AS type,state,created_at AS createdAt,updated_at AS updatedAt FROM privacy_requests WHERE user_id=? ORDER BY created_at').bind(user.id).all(),
-          loadFactors(env, user.id)
+          loadFactors(env, user.id),
+          env.DB.prepare('SELECT owned, profile_id, profile_name, error, checked_at FROM minecraft_profiles WHERE user_id=?').bind(user.id).first()
         ]);
         return json(env, {
           profile: { id: user.id, name: user.name, email: user.email, staff: user.staff, developer: user.developer, handle: user.handle ?? null },
           identities: identities.results, activeSessions: sessions.results, policyAcceptances: acceptances.results,
           deletionRequest: deletion ?? null, privacyRequests: privacy.results,
-          mfa: { factors: mfa.list, passkeys: mfa.passkeyCount, totp: Boolean(mfa.totp), recoveryCodes: mfa.recoveryCount },
+          mfa: { factors: mfa.list, passkeys: mfa.passkeyCount, totp: mfa.totpCount, recoveryCodes: mfa.recoveryCount },
+          minecraft: minecraft ? { owned: minecraft.owned, profileId: minecraft.profile_id, profileName: minecraft.profile_name, checkedAt: minecraft.checked_at } : null,
           exportedAt: new Date().toISOString()
         });
       }

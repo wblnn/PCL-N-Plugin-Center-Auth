@@ -51,3 +51,11 @@ and publishes it with the authentication custom domain.
 部署顺序：先 `wrangler d1 migrations apply pcln-production --remote`，再 `wrangler deploy`。
 本地开发 `pnpm dev`（端口 5733，与 Web 仓库 vite 代理一致）；单元测试 `pnpm test`（零依赖，
 覆盖 RFC 6238 向量、CBOR 往返、真实 P-256 密钥的 WebAuthn 注册/断言全流程）。
+
+## Microsoft 绑定 → Xbox → Minecraft 档案（migration 0008）
+
+- Microsoft **绑定（link）模式**额外请求 `XboxLive.signin`；普通登录保持最小 scope。
+- 绑定成功后服务端执行 XBL → XSTS → `entitlements/mcstore` → `minecraft/profile` 链路，
+  将拥有状况与档案（UUID/名称）写入 `minecraft_profiles`；不存储任何 Xbox/MC 令牌。
+  链路失败不阻塞绑定，错误码记入 `error` 字段并写审计（`minecraft.checked`）。
+- `GET /auth/v1/account/minecraft` — 账户页与启动器共用读取端点；解绑 Microsoft 时级联清除。
