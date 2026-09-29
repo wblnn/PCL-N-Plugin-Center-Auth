@@ -424,7 +424,7 @@ export default {
       }
       if (path === '/auth/v1/login/totp' && request.method === 'POST') {
         const input = await body(request);
-        const row = await consumeChallenge(env, input?.challenge, 'login');
+        const row = await loadChallenge(env, input?.challenge, 'login');
         const user = await env.DB.prepare('SELECT id, COALESCE(display_name,name) AS name, disabled FROM users WHERE id=?').bind(row.user_id).first();
         if (!user || user.disabled) fail(403, '账户已被停用');
         const code = String(input?.code ?? '');
@@ -443,6 +443,9 @@ export default {
           }
         }
         if (!method) { await auditEvent(env, row.user_id, 'login.mfa.failed', null).run(); fail(401, '验证码不正确'); }
+        // 验证通过才消费挑战：输错验证码可原地重试，无需重新输入密码。
+        const consumedRow = await env.DB.prepare('UPDATE login_challenges SET consumed=1 WHERE challenge_hash=? AND consumed=0').bind(row.challenge_hash).run();
+        if (!consumedRow.meta.changes) fail(401, '登录挑战已被使用，请重新开始');
         await auditEvent(env, row.user_id, 'login.' + method, recoveryRemaining !== undefined ? `remaining:${recoveryRemaining}` : null).run();
         const session = await createSession(env, user, 'console', Date.now(), secure);
         return json(env, { ok: true, method, ...(recoveryRemaining !== undefined ? { recovery: { remaining: recoveryRemaining } } : {}), user: { id: user.id, name: user.name } }, 200, { 'set-cookie': session.cookie });
@@ -456,6 +459,8 @@ export default {
         let handle, name;
         try { handle = validateHandle(input?.handle); name = validateDisplayName(input?.name); } catch (error) { fail(400, error.message); }
         let hash; try { hash = await hashPassword(String(input?.password ?? '')); } catch (error) { fail(400, error.message); }
+        // 同 handle 的废弃未确认注册先级联清理，允许用户重新开始注册。
+        await env.DB.prepare('DELETE FROM users WHERE user_handle=? AND confirmed_at IS NULL').bind(handle).run();
         const taken = await env.DB.prepare('SELECT 1 FROM users WHERE user_handle=? OR name=?').bind(handle, handle).first();
         if (taken) fail(409, '该用户 ID 已被占用');
         const userId = crypto.randomUUID(), totpId = crypto.randomUUID();
@@ -477,7 +482,7 @@ export default {
       }
       if (path === '/auth/v1/register/confirm' && request.method === 'POST') {
         const input = await body(request);
-        const row = await consumeChallenge(env, input?.challenge, 'register');
+        const row = await loadChallenge(env, input?.challenge, 'register');
         const pending = await env.DB.prepare('SELECT id,secret FROM mfa_totp WHERE user_id=? AND confirmed=0').bind(row.user_id).first();
         if (!pending) fail(400, '注册已失效，请重新开始');
         const step = await verifyTotp(await decryptSecret(pending.secret, env.MFA_ENC_KEY), String(input?.code ?? ''));
@@ -485,6 +490,8 @@ export default {
         const user = await env.DB.prepare('SELECT id, COALESCE(display_name,name) AS name, disabled, confirmed_at FROM users WHERE id=?').bind(row.user_id).first();
         if (!user || user.disabled) fail(403, '账户不可用');
         if (user.confirmed_at) fail(409, '该注册已完成，请直接登录');
+        const consumedRow = await env.DB.prepare('UPDATE login_challenges SET consumed=1 WHERE challenge_hash=? AND consumed=0').bind(row.challenge_hash).run();
+        if (!consumedRow.meta.changes) fail(409, '该注册确认已被使用');
         const nowIso = new Date().toISOString();
         const [terms, privacy] = await Promise.all([currentPolicy(env, 'terms'), currentPolicy(env, 'privacy')]);
         await env.DB.batch([
