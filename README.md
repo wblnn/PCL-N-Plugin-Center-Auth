@@ -73,3 +73,19 @@ and publishes it with the authentication custom domain.
   `microsoft_tokens`；未配置密钥则拒绝落盘。解绑与注销级联清除。
 - `POST /auth/v1/minecraft/token` — 启动器端点：用保管的刷新令牌重新派生 XSTS，
   实时返回 Minecraft 短时令牌与档案（不存令牌本体），限流 10 次/小时，写审计。
+
+## 等级与经验系统（migration 0010）
+
+- **Lv0~7**：Lv0→1 需启动一次游戏（`game.first_launch`，一次性）；Lv2~7 按累计经验
+  **2k / 5k / 10k / 20k / 50k / 100k**。等级由服务端按 `xp + launched` 实时计算，不存冗余字段。
+- 经验事件（`XP_RULES` 可调）：首启 +100、游戏启动 +10、游玩每分钟 +1、完成安装 +20、资源下载 +5；
+  每用户每“事件发生日”上限 500（首启豁免），`dedupeKey` 幂等防重放。
+- **内部通道**（`SERVICE_TOKEN` Bearer 鉴权，豁免浏览器 Origin 检查，供 nexa-api/遥测管道调用）：
+  - `POST /internal/v1/xp` `{user, events:[{type, amount?, dedupeKey?, occurredAt?}]}`
+  - `POST /internal/v1/flags` `{user, flag, value}` — 如商店侧写入 `popular_plugin`（下载量>1k 证据）
+- 用户端 `GET /auth/v1/account/level` — 等级/经验/下一级进度/角色/资格达成情况/我的申请；
+  会话与 `/tokens` 响应也携带 `level`、`xp`、`trustedDeveloper`。
+- **资格申请**（`POST /auth/v1/applications`）：developer 需 Lv2；trusted_developer 需
+  developer + Lv3 + `popular_plugin` 标记；admin 需 Lv4。同类 pending 唯一；已具备角色 409。
+- **审批**（staff）：`GET /applications/pending`、`POST /applications/:id/review {decision,note}`；
+  不能审批自己的申请；批准即写 `users.developer / trusted_developer / staff`，全程审计。

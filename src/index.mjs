@@ -72,6 +72,37 @@ const RP_ID = env => env.RP_ID || (env.LOCAL_DEV === 'true' ? 'localhost' : 'pcl
 const webauthnOrigins = env => [env.WEB_ORIGIN, 'https://auth.pcln.top', ...(env.LOCAL_DEV === 'true' ? ['http://127.0.0.1:5730', 'http://localhost:5730'] : [])].filter(Boolean);
 const clientIp = request => request.headers.get('cf-connecting-ip') || 'unknown';
 const hasRealPassword = hash => Boolean(hash) && !hash.startsWith('oauth:') && !hash.startsWith('system:');
+// ---------- 等级与经验 ----------
+// Lv0→1:启动一次游戏(launched 标记);Lv2~7:累计经验达到阈值。
+const LEVEL_THRESHOLDS = { 2: 2000, 3: 5000, 4: 10000, 5: 20000, 6: 50000, 7: 100000 };
+const XP_RULES = {
+  'game.first_launch': { xp: 100, once: true, setsLaunched: true },
+  'game.launch': { xp: 10 },
+  'game.play_minutes': { xpPerUnit: 1 },   // amount = 游玩分钟数
+  'install.complete': { xp: 20 },
+  'resource.download': { xp: 5 }
+};
+const XP_DAILY_CAP = 500; // 每用户每 UTC 日通过事件累计的经验上限(game.first_launch 豁免)
+function computeLevel(xp, launched) {
+  if (!launched) return 0;
+  let level = 1;
+  for (let l = 2; l <= 7; l++) { if (xp >= LEVEL_THRESHOLDS[l]) level = l; else break; }
+  return level;
+}
+async function loadLevel(env, userId) {
+  const row = await env.DB.prepare('SELECT xp, launched, first_launch_at FROM user_levels WHERE user_id=?').bind(userId).first();
+  const xp = row?.xp ?? 0, launched = row?.launched ? 1 : 0;
+  const level = computeLevel(xp, launched);
+  const nextLevel = level < 7 ? level + 1 : null;
+  return {
+    level, xp, launched: Boolean(launched), firstLaunchAt: row?.first_launch_at ?? null,
+    next: nextLevel ? { level: nextLevel, threshold: LEVEL_THRESHOLDS[nextLevel], remaining: Math.max(0, LEVEL_THRESHOLDS[nextLevel] - xp) } : null
+  };
+}
+const serviceAuth = (request, env) => {
+  const token = (request.headers.get('authorization') || '').replace(/^Bearer /, '');
+  if (!env.SERVICE_TOKEN || token !== env.SERVICE_TOKEN) fail(401, '服务凭据无效');
+};
 async function rateLimit(env, key, limit, windowMs, message) {
   const now = Date.now();
   const row = await env.DB.prepare('INSERT INTO rate_limits(key,count,expires) VALUES(?,1,?) ON CONFLICT(key) DO UPDATE SET count=CASE WHEN expires<=? THEN 1 ELSE count+1 END,expires=CASE WHEN expires<=? THEN excluded.expires ELSE expires END RETURNING count').bind(key, now + windowMs, now, now).first();
@@ -128,11 +159,12 @@ async function currentPolicy(env, kind) {
 async function sessionUser(env, request, scope) {
   const value = credential(request, scope);
   if (!value) fail(401, '请先登录');
-  const user = await env.DB.prepare(`SELECT u.id,COALESCE(u.display_name,u.name) AS name,u.email,u.staff,u.developer,u.user_handle AS handle,(u.confirmed_at IS NULL) AS setupRequired,
+  const user = await env.DB.prepare(`SELECT u.id,COALESCE(u.display_name,u.name) AS name,u.email,u.staff,u.developer,u.trusted_developer AS trustedDeveloper,u.user_handle AS handle,(u.confirmed_at IS NULL) AS setupRequired,
     EXISTS(SELECT 1 FROM terms_acceptances ta JOIN policy_documents pd ON pd.id=ta.policy_id AND pd.kind='terms' AND pd.current=1 WHERE ta.user_id=u.id) AS termsAccepted
     FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.scope=? AND s.expires>? AND u.disabled=0 AND (?=0 OR u.staff=1)`).bind(digest(value), scope, Date.now(), scope === 'operations' ? 1 : 0).first();
   if (!user) fail(401, '请先登录');
-  return user;
+  const level = await loadLevel(env, user.id);
+  return { ...user, level: level.level, xp: level.xp };
 }
 async function createSession(env, user, scope, now, secure) {
   const value = randomBytes(32).toString('base64url');
@@ -300,7 +332,8 @@ export default {
       const secure = env.LOCAL_DEV !== 'true';
       if (!env.WEB_ORIGIN || (secure && !env.WEB_ORIGIN.startsWith('https://'))) fail(503, '身份服务尚未配置');
       if (request.method === 'OPTIONS' && path.startsWith('/auth/v1/')) return new Response(null, { status: 204, headers: { ...cors(env), 'access-control-allow-methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS', 'access-control-allow-headers': 'content-type, x-nexa-request, authorization', 'access-control-max-age': '600' } });
-      if (!['GET', 'HEAD'].includes(request.method) && (request.headers.get('origin') !== env.WEB_ORIGIN || request.headers.get('x-nexa-request') !== '1')) fail(403, '请求来源无效');
+      // /internal/* 为服务间通道,以 SERVICE_TOKEN 鉴权,不适用浏览器 Origin 检查。
+      if (!path.startsWith('/internal/') && !['GET', 'HEAD'].includes(request.method) && (request.headers.get('origin') !== env.WEB_ORIGIN || request.headers.get('x-nexa-request') !== '1')) fail(403, '请求来源无效');
       const oauthMatch = path.match(/^\/auth\/v1\/oauth\/(github|microsoft|google)\/(start|callback)$/);
       if (oauthMatch && request.method === 'GET') return await (oauthMatch[2] === 'start' ? oauthStart(request, env, oauthMatch[1]) : oauthCallback(request, env, oauthMatch[1], secure));
       if (path === '/auth/v1/sessions' && request.method === 'POST') fail(404, '接口不存在');
@@ -515,6 +548,160 @@ export default {
         ]);
         if (!status.owned) fail(403, '该 Microsoft 账户未拥有 Minecraft');
         return json(env, { accessToken: status.accessToken, profileId: status.profileId, profileName: status.profileName, owned: true });
+      }
+      // ---------- 内部服务通道(启动器遥测 → nexa-api → 此处;SERVICE_TOKEN 鉴权) ----------
+      if (path === '/internal/v1/xp' && request.method === 'POST') {
+        serviceAuth(request, env);
+        const input = await body(request, 16384);
+        const user = await env.DB.prepare('SELECT id FROM users WHERE id=? OR user_handle=?').bind(String(input?.user ?? ''), String(input?.user ?? '')).first();
+        if (!user) fail(404, '用户不存在');
+        if (!Array.isArray(input?.events) || !input.events.length || input.events.length > 100) fail(400, 'events 需为 1–100 条');
+        let applied = 0, ignored = 0;
+        // 每日上限按"事件发生日"计:每个游玩日最多 XP_DAILY_CAP,历史补报不占今天的额度。
+        const dayCache = new Map();
+        const dayTotal = async day => {
+          if (!dayCache.has(day)) {
+            const row = await env.DB.prepare("SELECT COALESCE(sum(amount),0) AS n FROM xp_events WHERE user_id=? AND occurred_at LIKE ? || '%'").bind(user.id, day).first();
+            dayCache.set(day, row?.n ?? 0);
+          }
+          return dayCache.get(day);
+        };
+        let current = await loadLevel(env, user.id);
+        for (const event of input.events.slice(0, 100)) {
+          const rule = XP_RULES[String(event?.type ?? '')];
+          if (!rule) { ignored++; continue; }
+          const dedupeKey = typeof event?.dedupeKey === 'string' && event.dedupeKey ? event.dedupeKey.slice(0, 120) : null;
+          if (rule.once) {
+            const done = await env.DB.prepare('SELECT 1 FROM xp_events WHERE user_id=? AND type=?').bind(user.id, event.type).first();
+            if (done) { ignored++; continue; }
+          }
+          const units = rule.xpPerUnit ? Math.max(0, Math.min(600, Number(event?.amount) || 0)) : 1;
+          if (rule.xpPerUnit && units === 0) { ignored++; continue; }
+          let gain = rule.xpPerUnit ? units : rule.xp;
+          const occurredAt = typeof event?.occurredAt === 'string' ? event.occurredAt : new Date().toISOString();
+          if (!rule.once) {
+            const day = occurredAt.slice(0, 10);
+            const room = Math.max(0, XP_DAILY_CAP - await dayTotal(day));
+            if (room === 0) { ignored++; continue; }
+            gain = Math.min(gain, room);
+            dayCache.set(day, (dayCache.get(day) ?? 0) + gain);
+          }
+          const nowIso = new Date().toISOString();
+          const statements = [
+            env.DB.prepare('INSERT INTO xp_events(user_id,type,amount,dedupe_key,occurred_at,created_at) VALUES(?,?,?,?,?,?)').bind(user.id, String(event.type), gain, dedupeKey, occurredAt, nowIso)
+          ];
+          if (rule.setsLaunched) {
+            statements.push(env.DB.prepare('INSERT INTO user_levels(user_id,xp,launched,first_launch_at,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET xp=user_levels.xp+excluded.xp, launched=1, first_launch_at=COALESCE(user_levels.first_launch_at,excluded.first_launch_at), updated_at=excluded.updated_at').bind(user.id, gain, 1, occurredAt, nowIso));
+          } else {
+            statements.push(env.DB.prepare('INSERT INTO user_levels(user_id,xp,launched,updated_at) VALUES(?,?,0,?) ON CONFLICT(user_id) DO UPDATE SET xp=user_levels.xp+excluded.xp, updated_at=excluded.updated_at').bind(user.id, gain, nowIso));
+          }
+          try { await env.DB.batch(statements); applied++; }
+          catch { ignored++; }
+          current = await loadLevel(env, user.id);
+        }
+        return json(env, { applied, ignored, xp: current.xp, level: current.level });
+      }
+      if (path === '/internal/v1/flags' && request.method === 'POST') {
+        serviceAuth(request, env);
+        const input = await body(request);
+        const user = await env.DB.prepare('SELECT id FROM users WHERE id=? OR user_handle=?').bind(String(input?.user ?? ''), String(input?.user ?? '')).first();
+        if (!user) fail(404, '用户不存在');
+        const flag = String(input?.flag ?? '');
+        if (!/^[a-z_]{3,40}$/.test(flag)) fail(400, '无效的标记名');
+        const value = typeof input?.value === 'string' ? input.value.slice(0, 200) : null;
+        await env.DB.prepare('INSERT INTO user_flags(user_id,flag,value,set_at) VALUES(?,?,?,?) ON CONFLICT(user_id,flag) DO UPDATE SET value=excluded.value, set_at=excluded.set_at').bind(user.id, flag, value, new Date().toISOString()).run();
+        await auditEvent(env, user.id, 'flag.set', `${flag}${value ? ':' + value : ''}`).run();
+        return json(env, { ok: true });
+      }
+      // ---------- 等级 / 资格申请 ----------
+      if (path === '/auth/v1/account/level' && request.method === 'GET') {
+        const user = await sessionUser(env, request, 'console');
+        const [level, popular, apps, profile] = await Promise.all([
+          loadLevel(env, user.id),
+          env.DB.prepare("SELECT value, set_at FROM user_flags WHERE user_id=? AND flag='popular_plugin'").bind(user.id).first(),
+          env.DB.prepare('SELECT id,kind,state,note,created_at,reviewed_at FROM applications WHERE user_id=? ORDER BY created_at DESC LIMIT 20').bind(user.id).all(),
+          env.DB.prepare('SELECT staff, developer, trusted_developer FROM users WHERE id=?').bind(user.id).first()
+        ]);
+        const met = {
+          developer: level.level >= 2,
+          trustedDeveloper: level.level >= 3 && Boolean(popular) && Boolean(profile?.developer),
+          admin: level.level >= 4
+        };
+        return json(env, {
+          ...level,
+          roles: { staff: Boolean(profile?.staff), developer: Boolean(profile?.developer), trustedDeveloper: Boolean(profile?.trusted_developer) },
+          popularPlugin: popular ? { evidence: popular.value, setAt: popular.set_at } : null,
+          requirements: {
+            developer: { level: 2, met: met.developer },
+            trustedDeveloper: { level: 3, popularPlugin: Boolean(popular), isDeveloper: Boolean(profile?.developer), met: met.trustedDeveloper },
+            admin: { level: 4, met: met.admin }
+          },
+          applications: apps.results
+        });
+      }
+      if (path === '/auth/v1/applications' && request.method === 'POST') {
+        const user = await sessionUser(env, request, 'console');
+        const input = await body(request);
+        const kind = String(input?.kind ?? '');
+        if (!['developer', 'trusted_developer', 'admin'].includes(kind)) fail(400, '无效的申请类型');
+        const profile = await env.DB.prepare('SELECT staff, developer, trusted_developer, confirmed_at FROM users WHERE id=?').bind(user.id).first();
+        if (!profile?.confirmed_at) fail(403, '请先完成注册');
+        if (kind === 'developer' && profile.developer) fail(409, '你已经是开发者');
+        if (kind === 'trusted_developer' && profile.trusted_developer) fail(409, '你已经是受信任的开发者');
+        if (kind === 'trusted_developer' && !profile.developer) fail(403, '需要先成为开发者');
+        if (kind === 'admin' && profile.staff) fail(409, '你已经是网站管理员');
+        const level = await loadLevel(env, user.id);
+        if (kind === 'developer' && level.level < 2) fail(403, '开发者申请需要达到 Lv2(先启动一次游戏,再累计 2,000 经验)');
+        if (kind === 'trusted_developer' && level.level < 3) fail(403, '受信任的开发者需要达到 Lv3(累计 5,000 经验)');
+        if (kind === 'admin' && level.level < 4) fail(403, '网站管理员申请需要达到 Lv4(累计 10,000 经验)');
+        if (kind === 'trusted_developer') {
+          const popular = await env.DB.prepare("SELECT 1 FROM user_flags WHERE user_id=? AND flag='popular_plugin'").bind(user.id).first();
+          if (!popular) fail(403, '受信任的开发者需要拥有一个下载量超过 1,000 的插件');
+        }
+        const id = crypto.randomUUID();
+        const nowIso = new Date().toISOString();
+        try {
+          await env.DB.batch([
+            env.DB.prepare("INSERT INTO applications(id,user_id,kind,state,created_at) VALUES(?,?,?,'pending',?)").bind(id, user.id, kind, nowIso),
+            auditEvent(env, user.id, 'application.submitted', kind)
+          ]);
+        } catch (error) {
+          if (String(error?.message ?? error).includes('UNIQUE')) fail(409, '已有同类型的待审申请');
+          throw error;
+        }
+        return json(env, { ok: true, id, kind, state: 'pending' }, 201);
+      }
+      if (path === '/auth/v1/applications/pending' && request.method === 'GET') {
+        const user = await sessionUser(env, request, 'console');
+        if (!user.staff) fail(403, '仅网站管理员可查看待审申请');
+        const rows = await env.DB.prepare(`SELECT a.id,a.kind,a.state,a.created_at,u.id AS user_id,COALESCE(u.display_name,u.name) AS user_name,u.user_handle,
+          COALESCE(ul.xp,0) AS xp, COALESCE(ul.launched,0) AS launched FROM applications a JOIN users u ON u.id=a.user_id
+          LEFT JOIN user_levels ul ON ul.user_id=u.id WHERE a.state='pending' ORDER BY a.created_at LIMIT 100`).all();
+        return json(env, { applications: rows.results.map(r => ({ id: r.id, kind: r.kind, createdAt: r.created_at, user: { id: r.user_id, name: r.user_name, handle: r.user_handle }, level: computeLevel(r.xp, r.launched) })) });
+      }
+      const reviewMatch = path.match(/^\/auth\/v1\/applications\/([0-9a-f-]{36})\/review$/);
+      if (reviewMatch && request.method === 'POST') {
+        const user = await sessionUser(env, request, 'console');
+        if (!user.staff) fail(403, '仅网站管理员可审批');
+        const input = await body(request);
+        const decision = input?.decision === 'approved' ? 'approved' : input?.decision === 'rejected' ? 'rejected' : null;
+        if (!decision) fail(400, 'decision 需为 approved 或 rejected');
+        const note = typeof input?.note === 'string' ? input.note.slice(0, 400) : null;
+        const app = await env.DB.prepare("SELECT id,user_id,kind,state FROM applications WHERE id=? AND state='pending'").bind(reviewMatch[1]).first();
+        if (!app) fail(404, '申请不存在或已处理');
+        if (app.user_id === user.id) fail(403, '不能审批自己的申请');
+        const nowIso = new Date().toISOString();
+        const statements = [
+          env.DB.prepare('UPDATE applications SET state=?, note=?, reviewed_at=?, reviewer=? WHERE id=?').bind(decision, note, nowIso, user.id, app.id),
+          auditEvent(env, user.id, 'application.reviewed', `${app.kind}:${decision}`)
+        ];
+        if (decision === 'approved') {
+          if (app.kind === 'developer') statements.push(env.DB.prepare('UPDATE users SET developer=1 WHERE id=?').bind(app.user_id));
+          if (app.kind === 'trusted_developer') statements.push(env.DB.prepare('UPDATE users SET trusted_developer=1 WHERE id=?').bind(app.user_id));
+          if (app.kind === 'admin') statements.push(env.DB.prepare('UPDATE users SET staff=1 WHERE id=?').bind(app.user_id));
+        }
+        await env.DB.batch(statements);
+        return json(env, { ok: true, state: decision });
       }
       if (path === '/auth/v1/mfa/factors' && request.method === 'GET') {
         const user = await sessionUser(env, request, 'console');
