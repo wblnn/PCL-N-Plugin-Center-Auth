@@ -5,6 +5,7 @@ import { validateHandle, validateDisplayName, normalizeHandle, isReservedHandle,
 import { randomSecret, otpauthUrl, verifyTotp, encryptSecret, decryptSecret } from './totp.mjs';
 import { generateRecoveryCodes, hashRecoveryCode } from './recovery.mjs';
 import { verifyRegistration, verifyAssertion, webauthnUserId } from './webauthn.mjs';
+import { MAX_LEVEL, PLATE_BONUS_STACKING, PLATE_FLAGS, activeBonus, buildContext, evaluateNameplates, nameplateCatalog, plateById } from './nameplates.mjs';
 class Failure extends Error { constructor(status, detail) { super(detail); this.status = status; } }
 const fail = (status, detail) => { throw new Failure(status, detail); };
 const cookieName = scope => scope === 'operations' ? 'nexa_staff' : 'nexa_console';
@@ -74,35 +75,217 @@ const clientIp = request => request.headers.get('cf-connecting-ip') || 'unknown'
 const hasRealPassword = hash => Boolean(hash) && !hash.startsWith('oauth:') && !hash.startsWith('system:');
 // ---------- 等级与经验 ----------
 // Lv0→1:启动一次游戏(launched 标记);Lv2~7:累计经验达到阈值。
-const LEVEL_THRESHOLDS = { 2: 2000, 3: 5000, 4: 10000, 5: 20000, 6: 50000, 7: 100000 };
-const XP_RULES = {
-  'game.first_launch': { xp: 100, once: true, setsLaunched: true },
-  'game.launch': { xp: 10 },
-  'game.play_minutes': { xpPerUnit: 1 },   // amount = 游玩分钟数
-  'install.complete': { xp: 20 },
-  'resource.download': { xp: 5 }
+export const LEVEL_THRESHOLDS = { 2: 2000, 3: 5000, 4: 10000, 5: 20000, 6: 50000, 7: 100000 };
+// 经验以「毫 XP」(micro = XP × 1000) 结算:0.5 XP/分钟这类小数速率逐次上报时不会丢余量。
+export const MICRO = 1000;
+// 经验来源全部由启动器上报事件(每日登录亦可由本站登录流程写入),**数值由 Worker 权威决定**:
+// 客户端只能声明「发生了什么、持续了多少分钟」,不能自行声明「这值多少经验」。
+//   daily.login             每日登录        +50 XP / UTC 日
+//   daily.launch            每日启动        +30 XP / UTC 日,并推进连续启动天数
+//   game.play_minutes       游戏时长        1 XP / 分钟,单日 ≤ 480 XP(8 小时)
+//   launcher.online_minutes Nexa 在线时长   0.5 XP / 分钟,单日 ≤ 180 XP(6 小时)
+//   game.first_launch       首次启动        +100 XP,一次性,不计入日上限
+export const XP_RULES = {
+  'daily.login': { micro: 50 * MICRO, perDay: 'last_login_day', label: '每日登录' },
+  'daily.launch': { micro: 30 * MICRO, perDay: 'last_launch_day', streak: true, setsLaunched: true, label: '每日启动' },
+  'game.first_launch': { micro: 100 * MICRO, once: true, capExempt: true, setsLaunched: true, label: '首次启动' },
+  'game.play_minutes': { microPerUnit: 1 * MICRO, unitCap: 720, dailyMicroCap: 480 * MICRO, accrue: 'game_minutes_total', label: '游戏时长' },
+  'launcher.online_minutes': { microPerUnit: 0.5 * MICRO, unitCap: 1440, dailyMicroCap: 180 * MICRO, accrue: 'launcher_minutes_total', label: 'Nexa 在线时长' }
 };
-const XP_DAILY_CAP = 500; // 每用户每 UTC 日通过事件累计的经验上限(game.first_launch 豁免)
-function computeLevel(xp, launched) {
+// 每用户每 UTC 日经验总上限(毫 XP)。理论满档为 50+30+480+180 = 740,全局上限兜底防刷。
+export const XP_DAILY_CAP = 700 * MICRO;
+export const XP_EVENT_TYPES = Object.keys(XP_RULES);
+// 可写入的资格标记白名单:这些标记直接驱动铭牌与开发者资格判定,不接受任意名称。
+const FLAG_ALLOWLIST = [...new Set([...Object.values(PLATE_FLAGS), 'popular_plugin'])].sort();
+// 经验来源说明(公开目录 / 账户页共用),数值直接取自 XP_RULES,避免文案与实现漂移。
+export function xpSourceCatalog() {
+  return XP_EVENT_TYPES.map(type => {
+    const rule = XP_RULES[type];
+    return {
+      type,
+      label: rule.label,
+      reporter: type === 'daily.login' ? 'launcher-or-web' : 'launcher',
+      ...(rule.micro !== undefined
+        ? { mode: rule.once ? 'once' : 'daily', xp: rule.micro / MICRO, dailyCap: rule.once ? null : rule.micro / MICRO }
+        : {
+          mode: 'duration', xpPerMinute: rule.microPerUnit / MICRO, unit: 'minute',
+          perEventUnitCap: rule.unitCap, dailyCap: rule.dailyMicroCap / MICRO
+        }),
+      countsTowardDailyCap: !rule.capExempt,
+      ...(rule.streak ? { advancesLaunchStreak: true } : {}),
+      ...(rule.setsLaunched ? { unlocksLevelOne: true } : {})
+    };
+  });
+}
+export function computeLevel(xp, launched) {
   if (!launched) return 0;
   let level = 1;
-  for (let l = 2; l <= 7; l++) { if (xp >= LEVEL_THRESHOLDS[l]) level = l; else break; }
+  for (let l = 2; l <= MAX_LEVEL; l++) { if (xp >= LEVEL_THRESHOLDS[l]) level = l; else break; }
   return level;
 }
+const utcDay = (iso = new Date().toISOString()) => String(iso).slice(0, 10);
+const prevUtcDay = day => new Date(new Date(`${day}T00:00:00Z`).getTime() - 86400000).toISOString().slice(0, 10);
+// 连续启动天数判定(纯函数,便于单测)。
+//   lastLaunchDay 为空     → 首次启动,连击 = 1
+//   lastLaunchDay >= day   → 旧日期补报:既不增长也不清零(避免补报把已有连击打断)
+//   lastLaunchDay = day-1  → 连击 + 1
+//   其余                   → 断签,重新从 1 开始
+export function nextLaunchStreak(lastLaunchDay, day, currentStreak) {
+  if (!lastLaunchDay) return 1;
+  if (lastLaunchDay >= day) return Number(currentStreak) || 0;
+  if (lastLaunchDay === prevUtcDay(day)) return (Number(currentStreak) || 0) + 1;
+  return 1;
+}
+// 时长类事件的计量单位归一:向下取整、非负、单次上报不超过 unitCap。
+// 定额事件(每日登录/每日启动/首次启动)不接受客户端计量,恒为 0。
+export function normalizeUnits(rule, rawAmount) {
+  if (rule.micro !== undefined) return 0;
+  return Math.max(0, Math.min(rule.unitCap, Math.floor(Number(rawAmount) || 0)));
+}
+// 经验结算(纯函数):基础值 → 铭牌加成 → 单来源日上限 → 全局日上限。
+// 顺序很重要:**先加成再套上限**,否则加成会被上限悄悄吃掉、且上限统计与实际入账不一致。
+// 返回应入账的毫 XP;0 表示本次不入账。
+export function computeXpGain({ rule, units, bonus = 1, sourceRoomMicro = Infinity, dayRoomMicro = Infinity }) {
+  const baseMicro = rule.micro !== undefined ? rule.micro : Math.round(units * rule.microPerUnit);
+  if (baseMicro <= 0) return 0;
+  // 加成倍率只允许 ≥ 1:畸形值(NaN / 0 / 负数 / 小于 1)一律退化为无加成,
+  // 任何情况下都不会因为铭牌数据异常而扣减用户经验。
+  const multiplier = Number.isFinite(bonus) && bonus > 1 ? bonus : 1;
+  let gainMicro = Math.round(baseMicro * multiplier);
+  if (rule.dailyMicroCap) gainMicro = Math.min(gainMicro, Math.max(0, sourceRoomMicro));
+  if (!rule.capExempt) gainMicro = Math.min(gainMicro, Math.max(0, dayRoomMicro));
+  return Math.max(0, gainMicro);
+}
 async function loadLevel(env, userId) {
-  const row = await env.DB.prepare('SELECT xp, launched, first_launch_at FROM user_levels WHERE user_id=?').bind(userId).first();
+  const row = await env.DB.prepare(`SELECT xp, xp_micro, launched, first_launch_at, last_login_day, last_launch_day,
+    launch_streak, launch_streak_best, game_minutes_total, launcher_minutes_total, equipped_plate
+    FROM user_levels WHERE user_id=?`).bind(userId).first();
   const xp = row?.xp ?? 0, launched = row?.launched ? 1 : 0;
   const level = computeLevel(xp, launched);
-  const nextLevel = level < 7 ? level + 1 : null;
+  const nextLevel = level < MAX_LEVEL ? level + 1 : null;
   return {
     level, xp, launched: Boolean(launched), firstLaunchAt: row?.first_launch_at ?? null,
+    micro: row?.xp_micro ?? xp * MICRO,
+    lastLoginDay: row?.last_login_day ?? null, lastLaunchDay: row?.last_launch_day ?? null,
+    streak: row?.launch_streak ?? 0, streakBest: row?.launch_streak_best ?? 0,
+    gameMinutes: row?.game_minutes_total ?? 0, launcherMinutes: row?.launcher_minutes_total ?? 0,
+    equippedPlate: row?.equipped_plate ?? null,
     next: nextLevel ? { level: nextLevel, threshold: LEVEL_THRESHOLDS[nextLevel], remaining: Math.max(0, LEVEL_THRESHOLDS[nextLevel] - xp) } : null
   };
+}
+// ---------- 铭牌派生 ----------
+// 读取派生所需的全部真实信号,组装成 nameplates.mjs 的上下文。
+async function nameplateContext(env, userId, level) {
+  const [flags, profile] = await Promise.all([
+    env.DB.prepare('SELECT flag,value FROM user_flags WHERE user_id=?').bind(userId).all(),
+    env.DB.prepare('SELECT staff FROM users WHERE id=?').bind(userId).first()
+  ]);
+  return buildContext({
+    level: level.level, xp: level.xp, launched: level.launched, staff: Boolean(profile?.staff),
+    streak: level.streak, streakBest: level.streakBest,
+    gameMinutes: level.gameMinutes, launcherMinutes: level.launcherMinutes,
+    flags: Object.fromEntries((flags.results ?? []).map(r => [r.flag, r.value]))
+  });
+}
+// 账户的铭牌评估结果 + 生效加成(取已拥有铭牌中的最高倍率,不叠加)。
+async function loadNameplates(env, userId, level) {
+  const resolved = level ?? await loadLevel(env, userId);
+  const ctx = await nameplateContext(env, userId, resolved);
+  const plates = evaluateNameplates(ctx);
+  const bonus = activeBonus(plates);
+  // 佩戴中的铭牌必须已拥有,否则视为未佩戴(例如订阅到期后仍残留的 sub_* 铭牌)。
+  const equipped = plates.find(p => p.id === resolved.equippedPlate && p.owned) ?? null;
+  return { plates, bonus, equipped, hidesLevel: Boolean(equipped?.replacesLevel) };
+}
+// ---------- 经验入账 ----------
+// 启动器遥测与本站登录流程共用。逐条事件处理,单条失败不影响其余事件。
+// 幂等:一次性事件用类型作键;每日事件由服务端按 UTC 日生成键(客户端无法伪造重复领取);
+// 时长类事件沿用调用方传入的 dedupeKey。全部受 xp_events(user_id, dedupe_key) 唯一索引保护。
+async function applyXpEvents(env, userId, events) {
+  let current = await loadLevel(env, userId);
+  const { bonus } = await loadNameplates(env, userId, current);
+  let applied = 0, ignored = 0, grantedMicro = 0;
+  const dayCache = new Map(), sourceDayCache = new Map();
+  const sumMicro = async (sql, binds) => (await env.DB.prepare(sql).bind(...binds).first())?.n ?? 0;
+  const dayTotal = async day => {
+    if (!dayCache.has(day)) dayCache.set(day, await sumMicro("SELECT COALESCE(sum(amount_micro),0) AS n FROM xp_events WHERE user_id=? AND occurred_at LIKE ? || '%'", [userId, day]));
+    return dayCache.get(day);
+  };
+  const sourceDayTotal = async (type, day) => {
+    const key = `${type}|${day}`;
+    if (!sourceDayCache.has(key)) sourceDayCache.set(key, await sumMicro("SELECT COALESCE(sum(amount_micro),0) AS n FROM xp_events WHERE user_id=? AND type=? AND occurred_at LIKE ? || '%'", [userId, type, day]));
+    return sourceDayCache.get(key);
+  };
+  for (const event of (Array.isArray(events) ? events : []).slice(0, 100)) {
+    const type = String(event?.type ?? '');
+    const rule = XP_RULES[type];
+    if (!rule) { ignored++; continue; }
+    const occurredAt = typeof event?.occurredAt === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(event.occurredAt) ? event.occurredAt : new Date().toISOString();
+    const day = utcDay(occurredAt);
+    // 服务端生成幂等键,客户端传入的键只对时长类事件生效。
+    let dedupeKey = typeof event?.dedupeKey === 'string' && event.dedupeKey ? event.dedupeKey.slice(0, 120) : null;
+    if (rule.once) dedupeKey = type;
+    else if (rule.perDay) dedupeKey = `${type}:${day}`;
+    if (dedupeKey) {
+      const done = await env.DB.prepare('SELECT 1 FROM xp_events WHERE user_id=? AND dedupe_key=?').bind(userId, dedupeKey).first();
+      if (done) { ignored++; continue; }
+    }
+    let units = 0, gainMicro;
+    if (rule.micro !== undefined) {
+      gainMicro = computeXpGain({ rule, units: 0, bonus, dayRoomMicro: rule.capExempt ? Infinity : Math.max(0, XP_DAILY_CAP - await dayTotal(day)) });
+    } else {
+      units = normalizeUnits(rule, event?.amount);
+      if (units <= 0) { ignored++; continue; }
+      // 日上限按「事件发生日」计:历史补报不占今天的额度。
+      gainMicro = computeXpGain({
+        rule, units, bonus,
+        sourceRoomMicro: Math.max(0, rule.dailyMicroCap - await sourceDayTotal(type, day)),
+        dayRoomMicro: Math.max(0, XP_DAILY_CAP - await dayTotal(day))
+      });
+    }
+    if (gainMicro <= 0) { ignored++; continue; }
+    // 记账缓存按实际入账值推进(可能已被上限削减)。
+    if (rule.dailyMicroCap) sourceDayCache.set(`${type}|${day}`, (sourceDayCache.get(`${type}|${day}`) ?? 0) + gainMicro);
+    if (!rule.capExempt) dayCache.set(day, (dayCache.get(day) ?? 0) + gainMicro);
+    // user_levels 用相对累加:单条 UPDATE 的右值全部取原行值(SQLite 语义),并发下不会丢更新。
+    const sets = ['xp_micro = xp_micro + ?', 'xp = CAST((xp_micro + ?) / ? AS INTEGER)', 'updated_at = ?'];
+    const binds = [gainMicro, gainMicro, MICRO, new Date().toISOString()];
+    if (rule.setsLaunched) { sets.push('launched = 1', 'first_launch_at = COALESCE(first_launch_at, ?)'); binds.push(occurredAt); }
+    if (rule.accrue && units > 0) { sets.push(`${rule.accrue} = ${rule.accrue} + ?`); binds.push(units); }
+    if (rule.perDay === 'last_login_day') { sets.push('last_login_day = MAX(COALESCE(last_login_day, ?), ?)'); binds.push(day, day); }
+    if (rule.streak) {
+      const streak = nextLaunchStreak(current.lastLaunchDay, day, current.streak);
+      // last_launch_day 只前进不回退:否则一条旧日期补报会把锚点拉回去,
+      // 让下一次正常启动被误判成「断签」而清零连击。
+      sets.push('launch_streak = ?', 'launch_streak_best = MAX(launch_streak_best, ?)', 'last_launch_day = MAX(COALESCE(last_launch_day, ?), ?)');
+      binds.push(streak, streak, day, day);
+    }
+    const nowIso = new Date().toISOString();
+    try {
+      await env.DB.batch([
+        env.DB.prepare('INSERT INTO user_levels(user_id,xp,xp_micro,launched,updated_at) VALUES(?,0,0,0,?) ON CONFLICT(user_id) DO NOTHING').bind(userId, nowIso),
+        env.DB.prepare(`UPDATE user_levels SET ${sets.join(', ')} WHERE user_id=?`).bind(...binds, userId),
+        env.DB.prepare('INSERT INTO xp_events(user_id,type,amount,amount_micro,dedupe_key,occurred_at,created_at) VALUES(?,?,?,?,?,?,?)').bind(userId, type, Math.floor(gainMicro / MICRO), gainMicro, dedupeKey, occurredAt, nowIso)
+      ]);
+      applied++; grantedMicro += gainMicro;
+    } catch { ignored++; continue; }
+    current = await loadLevel(env, userId);
+  }
+  return { applied, ignored, grantedXp: Math.floor(grantedMicro / MICRO), bonus, level: current };
 }
 const serviceAuth = (request, env) => {
   const token = (request.headers.get('authorization') || '').replace(/^Bearer /, '');
   if (!env.SERVICE_TOKEN || token !== env.SERVICE_TOKEN) fail(401, '服务凭据无效');
 };
+// 「每日登录」经验:在真实登录成功点(第三方回调 / passkey / 验证器码)写入。
+// 与启动器上报共用同一幂等键 daily.login:<UTC 日>,两条通道不会重复计分。
+// 注意:POST /auth/v1/tokens 是既有 Cookie 会话换取内存令牌(每次刷新页面都会调用),
+// 不算登录,故不在那里写入,否则「每日登录」会退化成「每日访问」。
+// 经验入账失败绝不阻塞登录流程。
+async function grantDailyLogin(env, userId, at = new Date().toISOString()) {
+  try { await applyXpEvents(env, userId, [{ type: 'daily.login', occurredAt: at }]); }
+  catch (error) { console.error(JSON.stringify({ xp: 'daily.login', error: String(error?.message ?? error).slice(0, 120) })); }
+}
 async function rateLimit(env, key, limit, windowMs, message) {
   const now = Date.now();
   const row = await env.DB.prepare('INSERT INTO rate_limits(key,count,expires) VALUES(?,1,?) ON CONFLICT(key) DO UPDATE SET count=CASE WHEN expires<=? THEN 1 ELSE count+1 END,expires=CASE WHEN expires<=? THEN excluded.expires ELSE expires END RETURNING count').bind(key, now + windowMs, now, now).first();
@@ -285,6 +468,7 @@ async function oauthCallback(request, env, provider, secure) {
     }
     const session = await createSession(env, user, 'console', now, secure);
     headers.append('set-cookie', session.cookie);
+    await grantDailyLogin(env, user.id);
     // 未完成注册的用户强制进入完善资料页;已确认用户按 return_to 回跳。
     if (!user.confirmed_at) headers.set('location', new URL('/register?setup=1', env.WEB_ORIGIN).toString());
     return new Response(null, { status: 303, headers });
@@ -456,6 +640,7 @@ export default {
           auditEvent(env, row.user_id, 'login.passkey', credential.name || null)
         ]);
         const session = await createSession(env, user, 'console', now, secure);
+        await grantDailyLogin(env, user.id);
         return json(env, { ok: true, user: { id: user.id, name: user.name } }, 200, { 'set-cookie': session.cookie });
       }
       if (path === '/auth/v1/login/totp' && request.method === 'POST') {
@@ -484,6 +669,7 @@ export default {
         if (!consumedRow.meta.changes) fail(401, '登录挑战已被使用，请重新开始');
         await auditEvent(env, row.user_id, 'login.' + method, recoveryRemaining !== undefined ? `remaining:${recoveryRemaining}` : null).run();
         const session = await createSession(env, user, 'console', Date.now(), secure);
+        await grantDailyLogin(env, user.id);
         return json(env, { ok: true, method, ...(recoveryRemaining !== undefined ? { recovery: { remaining: recoveryRemaining } } : {}), user: { id: user.id, name: user.name } }, 200, { 'set-cookie': session.cookie });
       }
       // ---------- 注册完善：第三方身份验证后设置用户名 / 用户 ID /（可选）密码 + TOTP ----------
@@ -550,87 +736,124 @@ export default {
         return json(env, { accessToken: status.accessToken, profileId: status.profileId, profileName: status.profileName, owned: true });
       }
       // ---------- 内部服务通道(启动器遥测 → nexa-api → 此处;SERVICE_TOKEN 鉴权) ----------
+      // 启动器只上报「事件类型 + 持续分钟数 + 发生时间」,经验数值与日上限全部由 Worker 决定。
       if (path === '/internal/v1/xp' && request.method === 'POST') {
         serviceAuth(request, env);
         const input = await body(request, 16384);
-        const user = await env.DB.prepare('SELECT id FROM users WHERE id=? OR user_handle=?').bind(String(input?.user ?? ''), String(input?.user ?? '')).first();
+        const key = String(input?.user ?? '');
+        const user = await env.DB.prepare('SELECT id FROM users WHERE id=? OR user_handle=?').bind(key, key).first();
         if (!user) fail(404, '用户不存在');
         if (!Array.isArray(input?.events) || !input.events.length || input.events.length > 100) fail(400, 'events 需为 1–100 条');
-        let applied = 0, ignored = 0;
-        // 每日上限按"事件发生日"计:每个游玩日最多 XP_DAILY_CAP,历史补报不占今天的额度。
-        const dayCache = new Map();
-        const dayTotal = async day => {
-          if (!dayCache.has(day)) {
-            const row = await env.DB.prepare("SELECT COALESCE(sum(amount),0) AS n FROM xp_events WHERE user_id=? AND occurred_at LIKE ? || '%'").bind(user.id, day).first();
-            dayCache.set(day, row?.n ?? 0);
-          }
-          return dayCache.get(day);
-        };
-        let current = await loadLevel(env, user.id);
-        for (const event of input.events.slice(0, 100)) {
-          const rule = XP_RULES[String(event?.type ?? '')];
-          if (!rule) { ignored++; continue; }
-          const dedupeKey = typeof event?.dedupeKey === 'string' && event.dedupeKey ? event.dedupeKey.slice(0, 120) : null;
-          if (rule.once) {
-            const done = await env.DB.prepare('SELECT 1 FROM xp_events WHERE user_id=? AND type=?').bind(user.id, event.type).first();
-            if (done) { ignored++; continue; }
-          }
-          const units = rule.xpPerUnit ? Math.max(0, Math.min(600, Number(event?.amount) || 0)) : 1;
-          if (rule.xpPerUnit && units === 0) { ignored++; continue; }
-          let gain = rule.xpPerUnit ? units : rule.xp;
-          const occurredAt = typeof event?.occurredAt === 'string' ? event.occurredAt : new Date().toISOString();
-          if (!rule.once) {
-            const day = occurredAt.slice(0, 10);
-            const room = Math.max(0, XP_DAILY_CAP - await dayTotal(day));
-            if (room === 0) { ignored++; continue; }
-            gain = Math.min(gain, room);
-            dayCache.set(day, (dayCache.get(day) ?? 0) + gain);
-          }
-          const nowIso = new Date().toISOString();
-          const statements = [
-            env.DB.prepare('INSERT INTO xp_events(user_id,type,amount,dedupe_key,occurred_at,created_at) VALUES(?,?,?,?,?,?)').bind(user.id, String(event.type), gain, dedupeKey, occurredAt, nowIso)
-          ];
-          if (rule.setsLaunched) {
-            statements.push(env.DB.prepare('INSERT INTO user_levels(user_id,xp,launched,first_launch_at,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET xp=user_levels.xp+excluded.xp, launched=1, first_launch_at=COALESCE(user_levels.first_launch_at,excluded.first_launch_at), updated_at=excluded.updated_at').bind(user.id, gain, 1, occurredAt, nowIso));
-          } else {
-            statements.push(env.DB.prepare('INSERT INTO user_levels(user_id,xp,launched,updated_at) VALUES(?,?,0,?) ON CONFLICT(user_id) DO UPDATE SET xp=user_levels.xp+excluded.xp, updated_at=excluded.updated_at').bind(user.id, gain, nowIso));
-          }
-          try { await env.DB.batch(statements); applied++; }
-          catch { ignored++; }
-          current = await loadLevel(env, user.id);
-        }
-        return json(env, { applied, ignored, xp: current.xp, level: current.level });
+        const result = await applyXpEvents(env, user.id, input.events);
+        return json(env, {
+          applied: result.applied, ignored: result.ignored,
+          grantedXp: result.grantedXp, bonus: result.bonus,
+          xp: result.level.xp, level: result.level.level,
+          acceptedTypes: XP_EVENT_TYPES
+        });
       }
       if (path === '/internal/v1/flags' && request.method === 'POST') {
         serviceAuth(request, env);
         const input = await body(request);
-        const user = await env.DB.prepare('SELECT id FROM users WHERE id=? OR user_handle=?').bind(String(input?.user ?? ''), String(input?.user ?? '')).first();
+        const key = String(input?.user ?? '');
+        const user = await env.DB.prepare('SELECT id FROM users WHERE id=? OR user_handle=?').bind(key, key).first();
         if (!user) fail(404, '用户不存在');
         const flag = String(input?.flag ?? '');
-        if (!/^[a-z_]{3,40}$/.test(flag)) fail(400, '无效的标记名');
+        // 标记名允许数字(如 bilibili_level / nexa_donation),且必须在白名单内:
+        // 这些标记直接驱动铭牌与资格判定,不接受任意自定义名称。
+        if (!/^[a-z0-9_]{3,40}$/.test(flag) || !FLAG_ALLOWLIST.includes(flag)) fail(400, `无效的标记名(可用:${FLAG_ALLOWLIST.join(', ')})`);
         const value = typeof input?.value === 'string' ? input.value.slice(0, 200) : null;
+        // 传 value: null 表示清除标记(例如订阅退订后收回订阅铭牌)。
+        if (value === null) {
+          await env.DB.batch([
+            env.DB.prepare('DELETE FROM user_flags WHERE user_id=? AND flag=?').bind(user.id, flag),
+            auditEvent(env, user.id, 'flag.cleared', flag)
+          ]);
+          return json(env, { ok: true, flag, cleared: true });
+        }
         await env.DB.prepare('INSERT INTO user_flags(user_id,flag,value,set_at) VALUES(?,?,?,?) ON CONFLICT(user_id,flag) DO UPDATE SET value=excluded.value, set_at=excluded.set_at').bind(user.id, flag, value, new Date().toISOString()).run();
         await auditEvent(env, user.id, 'flag.set', `${flag}${value ? ':' + value : ''}`).run();
-        return json(env, { ok: true });
+        return json(env, { ok: true, flag });
+      }
+      // ---------- 铭牌墙 ----------
+      // 公开目录:未登录也可读取规则,供 /nameplates 铭牌墙页面渲染。
+      if (path === '/auth/v1/nameplates' && request.method === 'GET') {
+        return json(env, {
+          plates: nameplateCatalog(),
+          levels: LEVEL_THRESHOLDS,
+          maxLevel: MAX_LEVEL,
+          xpSources: xpSourceCatalog(),
+          dailyCap: XP_DAILY_CAP / MICRO,
+          bonusStacking: PLATE_BONUS_STACKING,
+          bonusNote: PLATE_BONUS_STACKING ? '多枚铭牌的加成相乘叠加' : '多枚铭牌不叠加,取已拥有铭牌中的最高加成'
+        }, 200, { 'cache-control': 'public, max-age=300' });
+      }
+      // 我的铭牌:已拥有清单、未达成进度、生效加成与佩戴状态。
+      if (path === '/auth/v1/account/nameplates' && request.method === 'GET') {
+        const user = await sessionUser(env, request, 'console');
+        const level = await loadLevel(env, user.id);
+        const { plates, bonus, equipped, hidesLevel } = await loadNameplates(env, user.id, level);
+        return json(env, { plates, bonus, equipped: equipped?.id ?? null, hidesLevel, displayLevel: hidesLevel ? null : level.level });
+      }
+      // 佩戴 / 卸下铭牌。只有 replacesLevel 的铭牌可以隐藏等级数字。
+      if (path === '/auth/v1/account/nameplates/equip' && request.method === 'PUT') {
+        const user = await sessionUser(env, request, 'console');
+        const input = await body(request);
+        const wanted = input?.plate === null || input?.plate === '' ? null : plateById(input?.plate);
+        if (input?.plate !== null && input?.plate !== '' && !wanted) fail(400, '未知的铭牌');
+        const level = await loadLevel(env, user.id);
+        if (wanted) {
+          const { plates } = await loadNameplates(env, user.id, level);
+          const owned = plates.find(p => p.id === wanted.id && p.owned);
+          if (!owned) fail(403, `尚未达成「${wanted.label}」铭牌`);
+        }
+        await env.DB.batch([
+          env.DB.prepare('INSERT INTO user_levels(user_id,xp,xp_micro,launched,equipped_plate,updated_at) VALUES(?,0,0,0,?,?) ON CONFLICT(user_id) DO UPDATE SET equipped_plate=excluded.equipped_plate, updated_at=excluded.updated_at').bind(user.id, wanted?.id ?? null, new Date().toISOString()),
+          auditEvent(env, user.id, 'nameplate.equipped', wanted?.id ?? 'none')
+        ]);
+        return json(env, { ok: true, equipped: wanted?.id ?? null, hidesLevel: Boolean(wanted?.replacesLevel) });
       }
       // ---------- 等级 / 资格申请 ----------
       if (path === '/auth/v1/account/level' && request.method === 'GET') {
         const user = await sessionUser(env, request, 'console');
-        const [level, popular, apps, profile] = await Promise.all([
-          loadLevel(env, user.id),
+        const level = await loadLevel(env, user.id);
+        const [popular, apps, profile, plates] = await Promise.all([
           env.DB.prepare("SELECT value, set_at FROM user_flags WHERE user_id=? AND flag='popular_plugin'").bind(user.id).first(),
           env.DB.prepare('SELECT id,kind,state,note,created_at,reviewed_at FROM applications WHERE user_id=? ORDER BY created_at DESC LIMIT 20').bind(user.id).all(),
-          env.DB.prepare('SELECT staff, developer, trusted_developer FROM users WHERE id=?').bind(user.id).first()
+          env.DB.prepare('SELECT staff, developer, trusted_developer FROM users WHERE id=?').bind(user.id).first(),
+          loadNameplates(env, user.id, level)
         ]);
         const met = {
           developer: level.level >= 2,
           trustedDeveloper: level.level >= 3 && Boolean(popular) && Boolean(profile?.developer),
           admin: level.level >= 4
         };
+        const today = utcDay();
         return json(env, {
           ...level,
           roles: { staff: Boolean(profile?.staff), developer: Boolean(profile?.developer), trustedDeveloper: Boolean(profile?.trusted_developer) },
           popularPlugin: popular ? { evidence: popular.value, setAt: popular.set_at } : null,
+          // 经验来源与今日进度:启动器据此展示「今天还能拿多少」。
+          xpSources: xpSourceCatalog().map(source => ({
+            ...source,
+            claimedToday: source.mode === 'daily' ? (source.type === 'daily.login' ? level.lastLoginDay === today : level.lastLaunchDay === today) : null
+          })),
+          dailyCap: XP_DAILY_CAP / MICRO,
+          thresholds: LEVEL_THRESHOLDS,
+          maxLevel: MAX_LEVEL,
+          // 连续启动天数与累计时长(LvMC / Lv∞ 铭牌依据)。
+          streak: { current: level.streak, best: level.streakBest, lastLaunchDay: level.lastLaunchDay },
+          minutes: { game: level.gameMinutes, launcher: level.launcherMinutes },
+          // 铭牌墙:全部铭牌(含未达成进度)、生效加成与佩戴状态。
+          nameplates: {
+            plates: plates.plates,
+            bonus: plates.bonus,
+            bonusStacking: PLATE_BONUS_STACKING,
+            equipped: plates.equipped?.id ?? null,
+            equippedPlate: plates.equipped,
+            hidesLevel: plates.hidesLevel,
+            displayLevel: plates.hidesLevel ? null : level.level
+          },
           requirements: {
             developer: { level: 2, met: met.developer },
             trustedDeveloper: { level: 3, popularPlugin: Boolean(popular), isDeveloper: Boolean(profile?.developer), met: met.trustedDeveloper },

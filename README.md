@@ -74,18 +74,103 @@ and publishes it with the authentication custom domain.
 - `POST /auth/v1/minecraft/token` — 启动器端点：用保管的刷新令牌重新派生 XSTS，
   实时返回 Minecraft 短时令牌与档案（不存令牌本体），限流 10 次/小时，写审计。
 
-## 等级与经验系统（migration 0010）
+## 等级与经验系统（migration 0010 / 0011）
 
 - **Lv0~7**：Lv0→1 需启动一次游戏（`game.first_launch`，一次性）；Lv2~7 按累计经验
   **2k / 5k / 10k / 20k / 50k / 100k**。等级由服务端按 `xp + launched` 实时计算，不存冗余字段。
-- 经验事件（`XP_RULES` 可调）：首启 +100、游戏启动 +10、游玩每分钟 +1、完成安装 +20、资源下载 +5；
-  每用户每“事件发生日”上限 500（首启豁免），`dedupeKey` 幂等防重放。
+
+### 加经验方式（migration 0011 重写）
+
+经验来源收敛为**四种日常行为 + 一次性首启**，全部由**启动器上报事件**，数值由 Worker 权威决定
+——客户端只能声明「发生了什么、持续了多少分钟」，**不能自行声明这值多少经验**：
+
+| 事件 `type` | 含义 | 数值 | 单日上限 |
+| --- | --- | --- | --- |
+| `daily.login` | 每日登录 | +50 XP / UTC 日 | 每日一次 |
+| `daily.launch` | 每日启动 | +30 XP / UTC 日，并推进连续启动天数 | 每日一次 |
+| `game.play_minutes` | 游戏时长 | 1 XP / 分钟（`amount` = 分钟数） | 480 XP（8 小时） |
+| `launcher.online_minutes` | Nexa 在线时长（启动器挂机，未启动 MC） | 0.5 XP / 分钟 | 180 XP（6 小时） |
+| `game.first_launch` | 首次启动 | +100 XP，一次性 | 豁免日上限 |
+
+- **全局日上限 700 XP**（按「事件发生日」计，历史补报不占今天的额度）。各来源上限之和为 740，
+  全局上限是最后一道兜底。
+- **毫 XP 结算**：`user_levels.xp_micro` 是权威累计值，`xp = floor(xp_micro / 1000)` 为派生整数。
+  这样 0.5 XP/分钟这类小数速率在逐次上报时不会丢余量（1 分钟 ×1.75 加成 = 875 毫 XP，攒够才进位）。
+- **幂等**：一次性事件的键为类型本身；每日事件的键由**服务端**按 `type:YYYY-MM-DD`（UTC）生成，
+  客户端无法伪造重复领取；时长类事件沿用调用方 `dedupeKey`。均受 `xp_events(user_id, dedupe_key)`
+  唯一索引保护，重放同一批事件不会重复计分。
+- **连续启动天数**：`launch_streak`（当前）/ `launch_streak_best`（历史最长）/ `last_launch_day`。
+  锚点**只前进不回退**，旧日期补报既不会增长也不会清零连击。
+- `daily.login` 亦可由本站真实登录成功点写入（第三方回调 / passkey / 验证器码），与启动器上报
+  共用同一幂等键，两条通道不会重复计分。`POST /auth/v1/tokens` 是既有 Cookie 会话换取内存令牌
+  （每次刷新页面都会调用），**不算登录**，故不在那里写入。
+
+### 铭牌墙（migration 0011）
+
+铭牌**不单独存储授予记录**，全部由真实信号实时派生（`src/nameplates.mjs`）：
+等级 / 连续启动 / 累计时长 / `user_flags` / `users.staff`。这样铭牌永远不会与账户实际状态漂移，
+也不需要「补发 / 回收」的后台流程。唯一持久化的状态是 `user_levels.equipped_plate`（佩戴中的铭牌）。
+
+**订阅铭牌**（每个 Cloud+ 档位一枚，各自带经验加成）：
+
+| 铭牌 | 条件 | 经验加成 |
+| --- | --- | --- |
+| Cloud+ Lite | 订阅 Lite 或更高档位 | ×1.10 |
+| Cloud+ Standard | 订阅 Standard 或更高档位 | ×1.25 |
+| Cloud+ Advanced | 订阅 Advanced 或更高档位 | ×1.45 |
+| Cloud+ Ultimate | 订阅 Ultimate 档位 | ×1.75 |
+
+**可代替等级的铭牌**（佩戴后可只显示铭牌、隐藏 Lv 数字）：
+
+| 铭牌 | 条件 | 经验加成 | 撤销 |
+| --- | --- | --- | --- |
+| **Lv∞** | 达到 Lv7 + 通过 ∞ 答题 + MC 累计时长 > 1000 小时 | ×2.00 | 永久 |
+| **Lv-1** | 成为网站管理员 | ×1.50 | 随管理员身份收回 |
+| **LvMC** | 连续 100 天启动 Minecraft（按历史最长连击） | ×1.60 | 断签不撤销 |
+
+**不可代替等级的荣誉铭牌**（与等级并列展示）：
+
+| 铭牌 | 条件 | 经验加成 |
+| --- | --- | --- |
+| b站来的 | 在 Bilibili 达到 Lv6 | ×1.05 |
+| 小黄标 | Bilibili 粉丝 > 100 万 | ×1.15 |
+| 我喜欢你 | 为 Nexa 无偿捐献 1000+ | ×1.30 |
+
+- **加成不叠加**：取已拥有铭牌中的最高倍率（当前上限 Lv∞ ×2.0）。叠加会让高阶订阅 + 全部荣誉
+  铭牌的用户达到 5 倍以上，经验曲线失控。开关见 `PLATE_BONUS_STACKING`。
+- **加成先于上限套用**：`基础值 → ×加成 → 单来源日上限 → 全局日上限`，因此加成永远无法突破日上限。
+- 需人工核验的铭牌由运营侧写入标记（附证据）：`bilibili_level`、`bilibili_followers`、
+  `nexa_donation`、`infinity_quiz`；订阅档位由计费侧写入 `cloud_plus_tier`（退订时传
+  `value: null` 清除）。`POST /internal/v1/flags` 的标记名已改为白名单校验（`FLAG_ALLOWLIST`），
+  不再接受任意自定义名称——这些标记直接驱动铭牌与资格判定。
+
+### 接口
+
 - **内部通道**（`SERVICE_TOKEN` Bearer 鉴权，豁免浏览器 Origin 检查，供 nexa-api/遥测管道调用）：
   - `POST /internal/v1/xp` `{user, events:[{type, amount?, dedupeKey?, occurredAt?}]}`
-  - `POST /internal/v1/flags` `{user, flag, value}` — 如商店侧写入 `popular_plugin`（下载量>1k 证据）
-- 用户端 `GET /auth/v1/account/level` — 等级/经验/下一级进度/角色/资格达成情况/我的申请；
-  会话与 `/tokens` 响应也携带 `level`、`xp`、`trustedDeveloper`。
+    → `{applied, ignored, grantedXp, bonus, xp, level, acceptedTypes}`
+  - `POST /internal/v1/flags` `{user, flag, value}` — `value: null` 表示清除标记
+- **公开**：`GET /auth/v1/nameplates` — 铭牌墙目录（未登录可读，`cache-control: max-age=300`），
+  含 `plates` / `levels` / `xpSources` / `dailyCap` / `bonusNote`。前端 `/nameplates` 页面直接渲染。
+- **用户端**：
+  - `GET /auth/v1/account/level` — 等级/经验/下一级进度/角色/资格达成情况/我的申请，
+    外加 `xpSources`（含 `claimedToday`）、`dailyCap`、`streak`、`minutes`、`nameplates`
+    （全部铭牌 + 未达成进度 + 生效加成 + 佩戴状态）。
+  - `GET /auth/v1/account/nameplates` — 我的铭牌、`bonus`、`equipped`、`hidesLevel`、`displayLevel`。
+  - `PUT /auth/v1/account/nameplates/equip` `{plate}` — 佩戴 / 卸下（`plate: null`）；
+    未达成的铭牌返回 403。会话与 `/tokens` 响应也携带 `level`、`xp`、`trustedDeveloper`。
 - **资格申请**（`POST /auth/v1/applications`）：developer 需 Lv2；trusted_developer 需
   developer + Lv3 + `popular_plugin` 标记；admin 需 Lv4。同类 pending 唯一；已具备角色 409。
 - **审批**（staff）：`GET /applications/pending`、`POST /applications/:id/review {decision,note}`；
   不能审批自己的申请；批准即写 `users.developer / trusted_developer / staff`，全程审计。
+
+### 测试
+
+- `pnpm test`（零依赖）：`tests/nameplates.test.mjs` 覆盖铭牌派生全部分支（订阅档位累积、
+  非法档位、Lv∞ 三条件、Lv-1 随身份收回、LvMC 断签不撤销、B 站阈值边界、加成取最高不叠加）；
+  `tests/xp.test.mjs` 覆盖经验结算（来源清单、定额/时长数值、单位归一、加成、单来源与全局上限、
+  连击跨月跨年与补报边界、等级判定、目录与规则一致性）。
+- `python3 scripts/verify-xp-sql.py`（本地验证脚本，非 CI）：用真实 SQLite 加载全部 migration，
+  复刻 `applyXpEvents` 的语句与判定顺序，端到端验证 SQL 语法、幂等重放、上限削减、毫 XP 余量
+  与连击锚点不回退。
+
