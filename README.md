@@ -154,8 +154,9 @@ and publishes it with the authentication custom domain.
   含 `plates` / `levels` / `xpSources` / `dailyCap` / `bonusNote`。前端 `/nameplates` 页面直接渲染。
 - **用户端**：
   - `GET /auth/v1/account/level` — 等级/经验/下一级进度/角色/资格达成情况/我的申请，
-    外加 `xpSources`（含 `claimedToday`）、`dailyCap`、`streak`、`minutes`、`nameplates`
-    （全部铭牌 + 未达成进度 + 生效加成 + 佩戴状态）。
+    外加 `xpSources`（含 `claimedToday`）、`dailyCap`、`thresholds`、`streak` / `streakBest` /
+    `lastLaunchDay`、`gameMinutes` / `launcherMinutes`、`nameplates`（全部铭牌 + 未达成进度
+    + 生效加成 + 佩戴状态）。字段保持扁平，不再包同名对象以免覆盖数值。
   - `GET /auth/v1/account/nameplates` — 我的铭牌、`bonus`、`equipped`、`hidesLevel`、`displayLevel`。
   - `PUT /auth/v1/account/nameplates/equip` `{plate}` — 佩戴 / 卸下（`plate: null`）；
     未达成的铭牌返回 403。会话与 `/tokens` 响应也携带 `level`、`xp`、`trustedDeveloper`。

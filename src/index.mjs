@@ -841,9 +841,10 @@ export default {
           dailyCap: XP_DAILY_CAP / MICRO,
           thresholds: LEVEL_THRESHOLDS,
           maxLevel: MAX_LEVEL,
-          // 连续启动天数与累计时长(LvMC / Lv∞ 铭牌依据)。
-          streak: { current: level.streak, best: level.streakBest, lastLaunchDay: level.lastLaunchDay },
-          minutes: { game: level.gameMinutes, launcher: level.launcherMinutes },
+          // 连续启动天数(streak / streakBest / lastLaunchDay)与累计时长
+          // (gameMinutes / launcherMinutes)已由 ...level 展开,保持扁平契约,
+          // 不再包一层同名对象 —— 否则 streak 会被对象覆盖掉数值。
+          // LvMC 铭牌依据 streakBest,Lv∞ 依据 gameMinutes。
           // 铭牌墙:全部铭牌(含未达成进度)、生效加成与佩戴状态。
           nameplates: {
             plates: plates.plates,
