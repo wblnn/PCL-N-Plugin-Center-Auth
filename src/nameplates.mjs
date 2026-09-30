@@ -78,7 +78,7 @@ export const NAMEPLATES = [
       const parts = [
         { label: `达到 Lv${MAX_LEVEL}`, done: ctx.level >= MAX_LEVEL, have: ctx.level, need: MAX_LEVEL, unit: '级' },
         { label: '通过 ∞ 答题', done: Boolean(ctx.flags[PLATE_FLAGS.infinityQuiz]) },
-        { label: 'MC 时长 1000 小时', done: ctx.gameMinutes >= INFINITY_MC_MINUTES, have: ctx.gameMinutes, need: INFINITY_MC_MINUTES, unit: '分钟' }
+        { label: 'MC 时长 1000 小时', done: ctx.gameMinutes > INFINITY_MC_MINUTES, have: ctx.gameMinutes, need: INFINITY_MC_MINUTES, unit: '分钟' }
       ];
       return { owned: parts.every(p => p.done), parts };
     }

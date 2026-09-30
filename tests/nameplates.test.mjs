@@ -57,13 +57,16 @@ test('各订阅档位有各自且递增的经验加成', () => {
 
 test('Lv∞ 需要三条件全部达成:Lv7 + ∞答题 + MC 1000 小时', () => {
   const quiz = { [PLATE_FLAGS.infinityQuiz]: '2026-09-01T00:00:00Z' };
-  const enough = { level: 7, gameMinutes: INFINITY_MC_MINUTES };
+  // 「大于 1000 小时」为严格超过:恰好 60000 分钟不算达成。
+  const enough = { level: 7, gameMinutes: INFINITY_MC_MINUTES + 1 };
   // 三项齐全 → 达成
   assert.ok(evaluateNameplates(ctx(enough, quiz)).find(p => p.id === 'lv_infinity').owned);
   // 缺等级
   assert.ok(!evaluateNameplates(ctx({ ...enough, level: 6 }, quiz)).find(p => p.id === 'lv_infinity').owned);
   // 缺答题
   assert.ok(!evaluateNameplates(ctx(enough, {})).find(p => p.id === 'lv_infinity').owned);
+  // 恰好 1000 小时不算「大于」
+  assert.ok(!evaluateNameplates(ctx({ ...enough, gameMinutes: INFINITY_MC_MINUTES }, quiz)).find(p => p.id === 'lv_infinity').owned);
   // 时长差 1 分钟
   assert.ok(!evaluateNameplates(ctx({ ...enough, gameMinutes: INFINITY_MC_MINUTES - 1 }, quiz)).find(p => p.id === 'lv_infinity').owned);
   // 未启动过游戏(launched=0 → level 0)
@@ -128,7 +131,7 @@ test('同时拥有 Lv∞ 与 Ultimate 时,加成取 Lv∞ 的 2.0 而非相乘',
     [PLATE_FLAGS.cloudTier]: 'Ultimate',
     [PLATE_FLAGS.infinityQuiz]: 'passed'
   };
-  const plates = evaluateNameplates(ctx({ level: 7, gameMinutes: INFINITY_MC_MINUTES }, flags));
+  const plates = evaluateNameplates(ctx({ level: 7, gameMinutes: INFINITY_MC_MINUTES + 1 }, flags));
   assert.ok(plates.find(p => p.id === 'lv_infinity').owned);
   assert.ok(plates.find(p => p.id === 'sub_ultimate').owned);
   assert.equal(activeBonus(plates), 2.0);
